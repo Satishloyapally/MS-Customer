@@ -3197,3 +3197,2992 @@ if __name__ == "__main__":
     App().mainloop()
 
 
+...........
+
+............
+
+...........
+
+# ==========================================================
+# CAFToolKit – All-in-One UI (Single-file)
+#
+# Author & Maintainer:
+#   Satish Loyapally – v-sloyapally@microsoft.com
+#   For enhancements, feedback, or issues with CAFToolKit,
+#   please reach out to Satish Loyapally at v-sloyapally@microsoft.com
+#
+# Features:
+#   0) Welcome & Runbook (contact info, step-by-step guide)
+#   1) Dependency Mapping (Azure Migrate, multi-file, CMDB optional)
+#   2) Pre-Migration Health Check (RVTools + Scoped)
+#   3) AVS Capacity Assessment (UsedPreferred / ProvisionedOnly, multi-node)
+#   4) Azure VM Assessment (RVTools -> Azure VM size recommendation)
+#   5) HCX Migration Status Pull (embedded PowerShell, username/password from UI)
+#   6) HCX Network Extension (NE) Status Pull (embedded PowerShell, optional VLAN mapping merge)
+#   7) Large VMs report (threshold in TB from RVTools)
+#   8) Post-Migration Validation (Ping + Traceroute for scoped servers)
+#   9) NSX-T to Azure NSG Mapping (CSV analysis, proposed NSG rules)
+#
+# Notes:
+#   - Tested logic expects Windows for PowerShell + HCX PowerCLI tasks.
+#   - Drag & Drop is optional (tkinterdnd2). If missing, Browse dialogs still work.
+# ==========================================================
+
+from __future__ import annotations
+
+import os
+import sys
+import math
+import time
+import queue
+import threading
+import webbrowser
+from collections import defaultdict, OrderedDict
+from pathlib import Path
+from datetime import datetime, timezone
+import re
+import subprocess
+import tempfile
+import warnings
+from typing import Dict, List, Optional, Tuple, Any
+
+import pandas as pd
+
+# Use non-interactive backend so matplotlib doesn't block Tk
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from tkinter import scrolledtext
+
+# Optional drag & drop
+_DND_AVAILABLE = False
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except Exception:
+    _DND_AVAILABLE = False
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ------------------------------
+# Contact / Author information
+# ------------------------------
+AUTHOR_NAME = "Satish Loyapally"
+AUTHOR_EMAIL = "v-sloyapally@microsoft.com"
+CONTACT_NOTE = (
+    f"For any issues, enhancements, or feedback regarding CAFToolKit,\n"
+    f"please reach out to {AUTHOR_NAME} at {AUTHOR_EMAIL}"
+)
+
+# ------------------------------
+# Defaults / constants
+# ------------------------------
+RVTOOLS_DEFAULT = r"C:\Users\v-UserID\RVTools_export_all_2025-Dallas.xlsx"
+SCOPE_DEFAULT = r"C:\Users\v-UserID\Downloads\Wave1.xlsx"
+OUT_PRE_DEFAULT = r"C:\Users\v-UserID\Downloads\Scoped_PreMigrationReport.xlsx"
+OUT_ASSESS_DEFAULT = r"C:\Users\v-UserID\Downloads\AVS_Assessment.xlsx"
+OUT_AZURE_ASSESS_DEFAULT = str(Path.home() / "Downloads" / "Azure_VM_Assessment.xlsx")
+LARGEVMS_OUT_DEFAULT = r"C:\temp"
+POSTMIG_OUT_DEFAULT = r"C:\temp\PostMigrationValidation.xlsx"
+NSX_OUT_DEFAULT = str(Path.home() / "Downloads" / "NSXT_to_NSG_CSV_Analysis")
+
+# Required columns for dependency mapping
+REQUIRED_COLUMNS = ['Source server name', 'Destination server name', 'Destination port']
+
+# AVS node types (from Azure VMware Solution documentation - may evolve)
+AVS_NODE_TYPES = {
+    # cores, mem GiB, vSAN raw capacity TB (capacity tier)
+    "AV36":   {"cores": 36, "mem_gib": 576,  "raw_tb": 15.2},
+    "AV36P":  {"cores": 36, "mem_gib": 768,  "raw_tb": 19.2},
+    "AV48":   {"cores": 48, "mem_gib": 768,  "raw_tb": 25.6},
+    "AV52":   {"cores": 52, "mem_gib": 1024, "raw_tb": 38.4},
+    "AV64":   {"cores": 64, "mem_gib": 1024, "raw_tb": 15.36},
+}
+
+# ==========================================================
+# Embedded PowerShell: HCX Migration Status Pull
+# ==========================================================
+HCX_PS_SCRIPT = r"""<#
+Embedded HCX Status Pull script for CAFToolKit
+- Connects to HCX using provided username/password (non-interactive)
+- Exports under: HCX_Status_<timestamp>\
+    HCX_Groups_<ts>.csv
+    HCX_GroupIds_Selected_<ts>.txt
+    HCX_Status_Raw_<ts>.csv
+    HCX_Status_Enriched_<ts>.csv
+    HCX_Status_Diagnostic_<ts>.log
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)][string]$HcxServer,
+  [Parameter(Mandatory=$true)][string]$UserName,
+  [Parameter(Mandatory=$true)][string]$Password,
+  [string]$OutputDir = "C:\temp",
+  [string[]]$IncludeGroupId,
+  [string[]]$IncludeGroupNameContains,
+  [string]$GroupIdFile
+)
+$ErrorActionPreference = 'Stop'
+function Write-Diag {
+  param([string]$Message, [ValidateSet('INFO','WARN','ERROR','DEBUG')][string]$Level='INFO')
+  $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:ss"), $Level, $Message
+  Write-Host $line
+  try { Add-Content -LiteralPath $DiagLog -Value $line -ErrorAction Stop } catch {}
+}
+function TryGet([object]$obj, [string[]]$names) {
+  if (-not $obj) { return $null }
+  foreach ($n in $names) {
+    if ($obj.PSObject.Properties.Name -contains $n) {
+      $v = $obj.$n
+      if ($null -ne $v -and "$v" -ne '') { return $v }
+    }
+  }
+  return $null
+}
+function AsString([object]$v) {
+  if ($null -eq $v) { return $null }
+  $s = "$v".Trim()
+  if ($s -eq '') { return $null }
+  return $s
+}
+function AsUtc([object]$v) {
+  try { if ($null -ne $v -and "$v" -ne '') { return ([datetime]$v).ToUniversalTime() } } catch {}
+  return $null
+}
+function Get-GroupId($GroupObj) {
+  if (-not $GroupObj) { return $null }
+  return (AsString (TryGet $GroupObj @('Id','Identifier','MobilityGroupId','Uid')))
+}
+function Get-GroupName($GroupObj) {
+  if (-not $GroupObj) { return $null }
+  $n = AsString (TryGet $GroupObj @('Name','GroupName','DisplayName'))
+  if ($n) { return $n }
+  return (AsString (TryGet $GroupObj @('Id','Identifier')))
+}
+function Get-MigGroupId($Mig) {
+  if (-not $Mig) { return $null }
+  $gid = AsString (TryGet $Mig @('MobilityGroupId','MigrationGroupId'))
+  if ($gid) { return $gid }
+  $mg = TryGet $Mig @('MobilityGroup')
+  if ($mg) { return AsString (TryGet $mg @('Id','Identifier')) }
+  return $null
+}
+function Get-MigGroupName($Mig) {
+  if (-not $Mig) { return $null }
+  $gn = AsString (TryGet $Mig @('MobilityGroupName','GroupName'))
+  if ($gn) { return $gn }
+  $mg = TryGet $Mig @('MobilityGroup')
+  if ($mg) { return AsString (TryGet $mg @('Name','GroupName','DisplayName')) }
+  return $null
+}
+# --- Paths / logging ---
+$ts     = Get-Date -Format "yyyyMMdd_HHmmss"
+$runDir = Join-Path $OutputDir ("HCX_Status_{0}" -f $ts)
+$null   = New-Item -ItemType Directory -Path $runDir -Force -ErrorAction SilentlyContinue
+$GroupsCsvPath  = Join-Path $runDir ("HCX_Groups_{0}.csv" -f $ts)
+$IdListPath     = Join-Path $runDir ("HCX_GroupIds_Selected_{0}.txt" -f $ts)
+$StatusRawCsv   = Join-Path $runDir ("HCX_Status_Raw_{0}.csv" -f $ts)
+$StatusEnriched = Join-Path $runDir ("HCX_Status_Enriched_{0}.csv" -f $ts)
+$DiagLog        = Join-Path $runDir ("HCX_Status_Diagnostic_{0}.log" -f $ts)
+Write-Host "Output folder: $runDir"
+# --- Modules ---
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+  Write-Diag "Installing VMware.PowerCLI (CurrentUser) ..." 'WARN'
+  Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
+}
+Import-Module VMware.PowerCLI -ErrorAction Stop
+Import-Module VMware.VimAutomation.Hcx -ErrorAction SilentlyContinue
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+# --- Connect ---
+Write-Diag ("Connecting to HCX server: {0}" -f $HcxServer)
+$pass = ConvertTo-SecureString $Password -AsPlainText -Force
+$null = Connect-HCXServer -Server $HcxServer -User $UserName -Password $pass -ErrorAction Stop
+# --- Step 1: Export all mobility groups ---
+Write-Diag "Querying all Mobility Groups (-Detailed) ..."
+$allGroups = @(Get-HCXMobilityGroup -Detailed -ErrorAction Stop)
+Write-Diag ("Mobility Groups discovered: {0}" -f $allGroups.Count)
+$allGroups | Export-Csv -LiteralPath $GroupsCsvPath -NoTypeInformation
+# --- Step 2: Select desired groups ---
+$selectedGroupIds = @()
+if ($IncludeGroupId -and $IncludeGroupId.Count -gt 0) {
+  $selectedGroupIds += ($IncludeGroupId | Where-Object { $_ -and "$_".Trim() -ne '' } | ForEach-Object { $_.Trim() })
+}
+if ($GroupIdFile -and (Test-Path -LiteralPath $GroupIdFile)) {
+  try {
+    $idsFromFile = Get-Content -LiteralPath $GroupIdFile | Where-Object { $_ -and "$_".Trim() -ne '' }
+    $selectedGroupIds += ($idsFromFile | ForEach-Object { $_.Trim() })
+  } catch {
+    Write-Diag ("Could not read GroupIdFile '{0}': {1}" -f $GroupIdFile,$_.Exception.Message) 'WARN'
+  }
+}
+if ($IncludeGroupNameContains -and $IncludeGroupNameContains.Count -gt 0) {
+  $pats = $IncludeGroupNameContains | ForEach-Object { $_.ToLower().Trim() } | Where-Object { $_ }
+  foreach ($g in $allGroups) {
+    $gName = (Get-GroupName $g)
+    $gNameLC = if ($gName) { $gName.ToLower() } else { '' }
+    foreach ($p in $pats) {
+      if ($gNameLC -like "*$p*") {
+        $id = Get-GroupId $g
+        if ($id) { $selectedGroupIds += $id }
+        break
+      }
+    }
+  }
+}
+if ($selectedGroupIds.Count -eq 0) {
+  Write-Diag "No filters provided; selecting ALL mobility groups." 'INFO'
+  foreach ($g in $allGroups) {
+    $id = Get-GroupId $g
+    if ($id) { $selectedGroupIds += $id }
+  }
+}
+$selectedGroupIds = $selectedGroupIds | Sort-Object -Unique
+Write-Diag ("Selected Mobility Groups: {0}" -f $selectedGroupIds.Count)
+$selectedGroupIds | Set-Content -LiteralPath $IdListPath -Encoding ASCII
+# --- Step 3: Pull migrations for selected groups ---
+$migsAll = @()
+try { $migsAll = @(Get-HCXMigration -ErrorAction SilentlyContinue) } catch { $migsAll = @() }
+$selIdSet = @{}
+foreach ($i in $selectedGroupIds) { $selIdSet[$i.ToLower()] = $true }
+$migs = @()
+foreach ($m in $migsAll) {
+  $gid = Get-MigGroupId $m
+  if ($gid -and $selIdSet.ContainsKey($gid.ToLower())) { $migs += $m }
+}
+Write-Diag ("Migration entries matched: {0}" -f $migs.Count)
+# --- RAW export ---
+$migs |
+  Select-Object VM,TargetComputeContainer,TargetComputeFolder,TargetDatastore,State,Status,Percentage,TotalSize,UsedSize,TotalBytes,StartTime,StartedOn,ScheduleStartTime,ScheduleEndTime,ScheduledStartTime,ScheduledEndTime |
+  Export-Csv -LiteralPath $StatusRawCsv -NoTypeInformation
+# --- ENRICHED export ---
+$rows = foreach ($m in $migs) {
+  $vmName = $null
+  $vmObj = TryGet $m @('VM','VMName')
+  if ($vmObj -and $vmObj.PSObject -and ($vmObj.PSObject.Properties.Name -contains 'Name')) { $vmName = [string]$vmObj.Name }
+  elseif ($vmObj) { $vmName = [string]$vmObj }
+  $grpName = Get-MigGroupName $m
+  $state = AsString (TryGet $m @('State','Status'))
+  $pct = AsString (TryGet $m @('Percentage'))
+  $sizeRaw = TryGet $m @('TotalSize','UsedSize','TotalBytes')
+  $start = TryGet $m @('StartTime','StartedOn')
+  $ss = TryGet $m @('ScheduleStartTime','ScheduledStartTime')
+  $se = TryGet $m @('ScheduleEndTime','ScheduledEndTime')
+  [pscustomobject]@{
+    GroupName              = $grpName
+    VMName                 = $vmName
+    TargetComputeContainer = AsString (TryGet $m @('TargetComputeContainer'))
+    TargetComputeFolder    = AsString (TryGet $m @('TargetComputeFolder'))
+    TargetDatastore        = AsString (TryGet $m @('TargetDatastore'))
+    State                  = $state
+    Percentage             = $pct
+    TotalSize_Input        = if ($sizeRaw) { "$sizeRaw" } else { $null }
+    StartTimeUTC           = AsUtc $start
+    ScheduleStartUTC       = AsUtc $ss
+    ScheduleEndUTC         = AsUtc $se
+  }
+}
+$rows | Sort-Object GroupName, VMName | Export-Csv -LiteralPath $StatusEnriched -NoTypeInformation
+Disconnect-HCXServer -Server $HcxServer -Confirm:$false | Out-Null
+Write-Diag "Disconnected from HCX." 'INFO'
+Write-Host ""
+Write-Host "Done."
+Write-Host "  Run folder     : $runDir"
+Write-Host "  Groups CSV     : $GroupsCsvPath"
+Write-Host "  Selected IDs   : $IdListPath"
+Write-Host "  RAW status     : $StatusRawCsv"
+Write-Host "  ENRICHED status: $StatusEnriched"
+Write-Host "  Log            : $DiagLog"
+"""
+
+# ==========================================================
+# Embedded PowerShell: HCX Network Extension Status Pull
+# ==========================================================
+NE_PS_SCRIPT = r"""<#
+Embedded HCX Network Extension (NE) Status Pull script for CAFToolKit
+- Connects to HCX using provided username/password (non-interactive)
+- Exports under: NE_Status_<RunTag>\
+    NE_Status_Raw_<RunTag>.csv
+    NE_Status_Diagnostic_<RunTag>.log
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)][string]$HcxServer,
+  [Parameter(Mandatory=$true)][string]$UserName,
+  [Parameter(Mandatory=$true)][string]$Password,
+  [string]$OutputDir = "C:\temp",
+  [string]$RunTag,
+  [string[]]$IncludeNameContains,
+  [string[]]$IncludeId
+)
+$ErrorActionPreference = 'Stop'
+# --- Paths / logging ---
+$ts     = if ($RunTag -and $RunTag.Trim() -ne '') { $RunTag } else { (Get-Date -Format "yyyyMMdd_HHmmss") }
+$runDir = Join-Path $OutputDir ("NE_Status_{0}" -f $ts)
+$null   = New-Item -ItemType Directory -Path $runDir -Force -ErrorAction SilentlyContinue
+$StatusRawCsv = Join-Path $runDir ("NE_Status_Raw_{0}.csv" -f $ts)
+$DiagLog      = Join-Path $runDir ("NE_Status_Diagnostic_{0}.log" -f $ts)
+function Write-Diag {
+  param([string]$Message, [ValidateSet('INFO','WARN','ERROR','DEBUG')][string]$Level='INFO')
+  $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:ss"), $Level, $Message
+  Write-Host $line
+  try { Add-Content -LiteralPath $DiagLog -Value $line -ErrorAction Stop } catch {}
+}
+function TryGet([object]$obj, [string[]]$names) {
+  if (-not $obj) { return $null }
+  foreach ($n in $names) {
+    if ($obj.PSObject.Properties.Name -contains $n) {
+      $v = $obj.$n
+      if ($null -ne $v -and "$v" -ne '') { return $v }
+    }
+  }
+  return $null
+}
+function AsString([object]$v) { if ($null -eq $v) { return $null }; $s="$v".Trim(); if ($s -eq '') { return $null }; return $s }
+function AsUtc([object]$v) { try { if ($null -ne $v -and "$v" -ne '') { return ([datetime]$v).ToUniversalTime() } } catch {}; return $null }
+Write-Host "Output folder: $runDir"
+# --- Modules ---
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+  Write-Diag "Installing VMware.PowerCLI (CurrentUser) ..." 'WARN'
+  Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
+}
+Import-Module VMware.PowerCLI -ErrorAction Stop
+Import-Module VMware.VimAutomation.Hcx -ErrorAction SilentlyContinue
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+# --- Connect ---
+Write-Diag ("Connecting to HCX server: {0}" -f $HcxServer)
+$pass = ConvertTo-SecureString $Password -AsPlainText -Force
+$null = Connect-HCXServer -Server $HcxServer -User $UserName -Password $pass -ErrorAction Stop
+# --- Pull Network Extensions ---
+if (-not (Get-Command -Name Get-HCXNetworkExtension -ErrorAction SilentlyContinue)) {
+  Write-Diag "Get-HCXNetworkExtension cmdlet not found. Ensure VMware.VimAutomation.Hcx is installed." 'ERROR'
+  throw "Get-HCXNetworkExtension cmdlet not found."
+}
+Write-Diag "Querying HCX Network Extensions ..."
+$exts = @(Get-HCXNetworkExtension -ErrorAction Stop)
+Write-Diag ("Network Extensions discovered: {0}" -f $exts.Count)
+# --- Filter (optional) ---
+if ($IncludeNameContains -and $IncludeNameContains.Count -gt 0) {
+  $pats = $IncludeNameContains | ForEach-Object { $_.ToLower().Trim() } | Where-Object { $_ }
+  $exts = $exts | Where-Object {
+    $n = AsString (TryGet $_ @('Name','NetworkName','DisplayName'))
+    $nlc = if ($n) { $n.ToLower() } else { '' }
+    foreach ($p in $pats) { if ($nlc -like "*$p*") { return $true } }
+    return $false
+  }
+  Write-Diag ("After Name filter: {0}" -f @($exts).Count)
+}
+if ($IncludeId -and $IncludeId.Count -gt 0) {
+  $idset = @{}
+  foreach ($i in $IncludeId) { if ($i) { $idset[$i.ToLower().Trim()] = $true } }
+  $exts = $exts | Where-Object {
+    $id = AsString (TryGet $_ @('Id','Identifier','Uid','NetworkExtensionId'))
+    if (-not $id) { return $false }
+    return $idset.ContainsKey($id.ToLower())
+  }
+  Write-Diag ("After ID filter: {0}" -f @($exts).Count)
+}
+# --- Flatten for export ---
+$rows = foreach ($e in $exts) {
+  [pscustomobject]@{
+    NetworkName         = AsString (TryGet $e @('Name','NetworkName','DisplayName'))
+    NetworkExtensionId  = AsString (TryGet $e @('Id','Identifier','Uid','NetworkExtensionId'))
+    State               = AsString (TryGet $e @('State','Status','ExtensionState','OperationalState'))
+    Health              = AsString (TryGet $e @('Health','HealthStatus','ServiceStatus'))
+    TunnelStatus        = AsString (TryGet $e @('TunnelStatus','TunnelState','InterconnectStatus'))
+    UplinkStatus        = AsString (TryGet $e @('UplinkStatus','UplinkState'))
+    SourceNetwork       = AsString (TryGet $e @('SourceNetworkName','SourceNetwork','Network'))
+    DestinationNetwork  = AsString (TryGet $e @('DestinationNetworkName','DestinationNetwork','TargetNetwork'))
+    VLAN                = AsString (TryGet $e @('VlanId','VLAN','Vlan','VlanID'))
+    CreatedTimeUTC      = AsUtc (TryGet $e @('CreatedTime','CreatedOn','CreationTime','CreatedAt'))
+    LastUpdatedTimeUTC  = AsUtc (TryGet $e @('LastUpdatedTime','UpdatedOn','ModifiedTime','LastModified','UpdatedAt'))
+  }
+}
+$rows | Sort-Object NetworkName | Export-Csv -LiteralPath $StatusRawCsv -NoTypeInformation
+Write-Diag ("NE status exported: {0}" -f $StatusRawCsv) 'INFO'
+Disconnect-HCXServer -Server $HcxServer -Confirm:$false | Out-Null
+Write-Diag "Disconnected from HCX." 'INFO'
+Write-Host ""
+Write-Host "Done."
+Write-Host "  RAW NE status : $StatusRawCsv"
+Write-Host "  Log           : $DiagLog"
+"""
+
+# ==========================================================
+# Shared helpers
+# ==========================================================
+
+def _normalize_text(s: Any) -> str:
+    return str(s).strip()
+
+def _normalize_port(p: Any) -> Optional[str]:
+    s = str(p).strip()
+    if not s or s.lower() in {"nan", "none", "n/a"}:
+        return None
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+def find_col(df: pd.DataFrame, patterns: List[str]) -> Optional[str]:
+    """Find a column whose name contains any of the patterns (case-insensitive)."""
+    for col in df.columns:
+        low = str(col).lower()
+        for p in patterns:
+            if p.lower() in low:
+                return col
+    return None
+
+def _split_multi(s: str) -> List[str]:
+    return [x.strip() for x in re.split(r"[,;\s]+", s or "") if x.strip()]
+
+def _read_any_table(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    ext = p.suffix.lower()
+    if ext == ".csv":
+        return pd.read_csv(p)
+    if ext in (".xlsx", ".xls"):
+        return pd.read_excel(p)
+    raise ValueError("Unsupported mapping file type. Use CSV or Excel.")
+
+def _normalize_hostname_for_matching(name: Any) -> str:
+    """Normalize hostname / asset tag for CMDB matching."""
+    s = str(name).strip().upper()
+    if not s:
+        return ""
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return s
+
+def _run_embedded_powershell(script_text: str, args: List[str], log_func=print) -> int:
+    """
+    Write script_text to a temp .ps1, execute PowerShell with args, delete temp file.
+    Returns exit code.
+    """
+    if os.name != "nt":
+        raise RuntimeError("PowerShell embedded scripts require Windows.")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ps1", mode="w", encoding="utf-8") as tmp:
+        tmp.write(script_text)
+        ps1_path = tmp.name
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path] + args
+    log_func(f"[PS] Running: {' '.join(cmd[:6])} ... (args hidden)")
+    try:
+        proc = subprocess.Popen(cmd)
+        return proc.wait()
+    finally:
+        try:
+            os.remove(ps1_path)
+        except Exception:
+            pass
+
+
+# ==========================================================
+# NSX-T to Azure NSG helpers (merged from second script)
+# ==========================================================
+
+def _nsx_ip_to_24(ip: str) -> Optional[str]:
+    ip = str(ip).strip()
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+        a, b, c, _ = ip.split(".")
+        return f"{a}.{b}.{c}.0/24"
+    return None
+
+def _nsx_canonicalize(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map export headers to canonical names:
+    Timestamp, RuleId, Action, Direction, Protocol, SourceIp, DestinationIp, SourcePort, DestinationPort
+    """
+    df = df.copy()
+    ts = find_col(df, ["timestamp"]) or find_col(df, ["time"])
+    rule = find_col(df, ["ruleid", "rule id", "rule_id"])
+    action = find_col(df, ["action"])
+    direction = find_col(df, ["direction"])
+    proto = find_col(df, ["protocol", "proto"])
+    src_ip = find_col(df, ["sourceip", "source ip", "srcip", "src ip"])
+    dst_ip = find_col(df, ["destinationip", "destination ip", "dstip", "dst ip", "dest ip"])
+    src_port = find_col(df, ["sourceport", "source port", "srcport", "src port"])
+    dst_port = find_col(df, ["destinationport", "destination port", "dstport", "dst port", "dport", "dest port"])
+
+    required = {
+        "Timestamp": ts,
+        "RuleId": rule,
+        "Action": action,
+        "Direction": direction,
+        "Protocol": proto,
+        "SourceIp": src_ip,
+        "DestinationIp": dst_ip,
+        "SourcePort": src_port,
+        "DestinationPort": dst_port,
+    }
+    missing = [k for k, v in required.items() if v is None]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}\nFound columns: {list(df.columns)}")
+
+    df = df.rename(columns={
+        ts: "Timestamp",
+        rule: "RuleId",
+        action: "Action",
+        direction: "Direction",
+        proto: "Protocol",
+        src_ip: "SourceIp",
+        dst_ip: "DestinationIp",
+        src_port: "SourcePort",
+        dst_port: "DestinationPort",
+    })
+    return df
+
+def run_nsx_csv_analysis(
+    input_files: List[str],
+    output_dir: str,
+    pass_only: bool = True,
+    src_agg_threshold: int = 20,
+    log=print
+) -> Dict[str, str]:
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for f in input_files:
+        log(f"[NSX] Reading: {f}")
+        raw_df = _read_any_table(f)
+        raw_df.columns = [str(c).strip() for c in raw_df.columns]
+        df = _nsx_canonicalize(raw_df)
+        df["SourceFile"] = os.path.basename(f)
+        frames.append(df)
+    df_all = pd.concat(frames, ignore_index=True)
+
+    # Normalize
+    df_all["Timestamp"] = pd.to_datetime(df_all["Timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
+    for col in ["SourcePort", "DestinationPort"]:
+        df_all[col] = pd.to_numeric(df_all[col], errors="coerce").astype("Int64")
+    df_all["Protocol"] = df_all["Protocol"].fillna("Any").astype(str).str.strip().str.upper()
+    df_all["Action"] = df_all["Action"].fillna("Unknown").astype(str).str.strip().str.upper()
+    df_all["Direction"] = df_all["Direction"].fillna("Unknown").astype(str).str.strip()
+
+    # 0) Input summary
+    input_summary = (
+        df_all.groupby("SourceFile")
+        .agg(
+            Rows=("Timestamp", "size"),
+            TimeMin=("Timestamp", "min"),
+            TimeMax=("Timestamp", "max"),
+            UniqueRuleIds=("RuleId", pd.Series.nunique),
+            UniqueSourceIps=("SourceIp", lambda s: s.dropna().nunique()),
+            UniqueDestIps=("DestinationIp", lambda s: s.dropna().nunique()),
+        ).reset_index()
+    )
+    input_summary.to_csv(out / "Input_Summary.csv", index=False)
+
+    # 1) Rule hits
+    rule_hits = (
+        df_all.groupby(["RuleId", "Protocol", "DestinationPort", "Direction", "Action"])
+        .size().reset_index(name="HitCount")
+        .sort_values("HitCount", ascending=False)
+    )
+    rule_hits.to_csv(out / "RuleId_Hits.csv", index=False)
+
+    # 2) Dest/Port analysis
+    dest_port = (
+        df_all.groupby(["SourceFile", "DestinationIp", "Protocol", "DestinationPort"])
+        .agg(
+            HitCount=("Timestamp", "size"),
+            UniqueSources=("SourceIp", lambda s: s.dropna().nunique()),
+            SourceIps=("SourceIp", lambda s: ", ".join(sorted(set(s.dropna().astype(str)))[:50])),
+            RuleIds=("RuleId", lambda s: ", ".join(map(str, sorted(set(pd.to_numeric(s, errors="coerce").dropna().astype(int)))))),
+        ).reset_index()
+        .sort_values("HitCount", ascending=False)
+    )
+    dest_port.to_csv(out / "Dest_Port_Analysis.csv", index=False)
+
+    # 3) Top flows (Top 2000)
+    top_flows = (
+        df_all.groupby(["SourceFile", "SourceIp", "DestinationIp", "Protocol", "DestinationPort", "Action", "RuleId"])
+        .size().reset_index(name="HitCount")
+        .sort_values("HitCount", ascending=False)
+        .head(2000)
+    )
+    top_flows.to_csv(out / "Top_Flows_Top2000.csv", index=False)
+
+    # 4) Proposed NSG rules
+    cand = df_all.copy()
+    if pass_only:
+        cand = cand[cand["Action"] == "PASS"].copy()
+    cand = cand.dropna(subset=["DestinationIp", "DestinationPort"])
+    grp = (
+        cand.groupby(["DestinationIp", "Protocol", "DestinationPort"])
+        .agg(
+            HitCount=("Timestamp", "size"),
+            SourceIps=("SourceIp", lambda s: sorted(set(s.dropna().astype(str)))),
+            RuleIds=("RuleId", lambda s: sorted(set(pd.to_numeric(s, errors="coerce").dropna().astype(int)))),
+        ).reset_index()
+        .sort_values("HitCount", ascending=False)
+    )
+    rows = []
+    prio = 1000
+    for _, r in grp.iterrows():
+        src_ips = r["SourceIps"]
+        src_24 = sorted(set(filter(None, (_nsx_ip_to_24(ip) for ip in src_ips))))
+        use_24 = (len(src_ips) > src_agg_threshold) and (len(src_24) <= len(src_ips)) and (len(src_24) > 0)
+        src_repr = ";".join(src_24 if use_24 else src_ips)
+        dst_ip = str(r["DestinationIp"]).strip()
+        proto = str(r["Protocol"]).strip().upper()
+        dport = int(r["DestinationPort"])
+        rows.append({
+            "Name": f"allow-{dst_ip.replace('.','-')}-{proto.lower()}-{dport}"[:80],
+            "Priority": prio,
+            "Direction": "Inbound",
+            "Access": "Allow",
+            "Protocol": proto if proto in ["TCP", "UDP", "ICMP"] else "*",
+            "SourceAddressPrefixes": src_repr,
+            "SourcePortRanges": "*",
+            "DestinationAddressPrefix": f"{dst_ip}/32",
+            "DestinationPortRanges": str(dport),
+            "Description": f"From NSX logs; RuleIds={','.join(map(str, r['RuleIds']))}; Hits={int(r['HitCount'])}",
+        })
+        prio += 10
+    pd.DataFrame(rows).to_csv(out / "Proposed_NSG_Rules.csv", index=False)
+
+    return {
+        "OutputFolder": str(out),
+        "Input_Summary": str(out / "Input_Summary.csv"),
+        "RuleId_Hits": str(out / "RuleId_Hits.csv"),
+        "Dest_Port_Analysis": str(out / "Dest_Port_Analysis.csv"),
+        "Top_Flows_Top2000": str(out / "Top_Flows_Top2000.csv"),
+        "Proposed_NSG_Rules": str(out / "Proposed_NSG_Rules.csv"),
+    }
+
+
+# ==========================================================
+# HCX runners (Python -> PowerShell)
+# ==========================================================
+
+def run_hcx_status_script(
+    hcx_server: str,
+    username: str,
+    password: str,
+    output_dir: str,
+    group_ids: Optional[List[str]] = None,
+    group_name_patterns: Optional[List[str]] = None,
+    group_id_file: Optional[str] = None,
+    log_func=print
+) -> Dict[str, str]:
+    if not hcx_server or not username or not password:
+        raise ValueError("HCX server, username and password are required.")
+    out_path = Path(output_dir).expanduser().resolve()
+    out_path.mkdir(parents=True, exist_ok=True)
+    args = ["-HcxServer", hcx_server, "-UserName", username, "-Password", password, "-OutputDir", str(out_path)]
+    for gid in (group_ids or []):
+        args += ["-IncludeGroupId", gid]
+    for pat in (group_name_patterns or []):
+        args += ["-IncludeGroupNameContains", pat]
+    if group_id_file:
+        args += ["-GroupIdFile", group_id_file]
+    log_func(f"[HCX] Output directory: {out_path}")
+    rc = _run_embedded_powershell(HCX_PS_SCRIPT, args, log_func=log_func)
+    log_func(f"[HCX] PowerShell exit code: {rc}")
+    if rc != 0:
+        raise RuntimeError(f"HCX script failed with exit code {rc}. Check logs under {out_path}.")
+    return {"returncode": str(rc), "output_dir": str(out_path)}
+
+def run_ne_status_script(
+    hcx_server: str,
+    username: str,
+    password: str,
+    output_dir: str,
+    ne_ids: Optional[List[str]] = None,
+    name_patterns: Optional[List[str]] = None,
+    log_func=print
+) -> Dict[str, str]:
+    if not hcx_server or not username or not password:
+        raise ValueError("HCX server, username and password are required.")
+    out_path = Path(output_dir).expanduser().resolve()
+    out_path.mkdir(parents=True, exist_ok=True)
+    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args = [
+        "-HcxServer", hcx_server,
+        "-UserName", username,
+        "-Password", password,
+        "-OutputDir", str(out_path),
+        "-RunTag", run_tag,
+    ]
+    for nid in (ne_ids or []):
+        args += ["-IncludeId", nid]
+    for pat in (name_patterns or []):
+        args += ["-IncludeNameContains", pat]
+    log_func(f"[NE] Output directory: {out_path}")
+    log_func(f"[NE] Run tag: {run_tag}")
+    rc = _run_embedded_powershell(NE_PS_SCRIPT, args, log_func=log_func)
+    log_func(f"[NE] PowerShell exit code: {rc}")
+    if rc != 0:
+        raise RuntimeError(f"NE status script failed with exit code {rc}. Check logs under {out_path}.")
+    run_dir = out_path / f"NE_Status_{run_tag}"
+    return {
+        "returncode": str(rc),
+        "output_base_dir": str(out_path),
+        "run_dir": str(run_dir),
+        "raw_csv": str(run_dir / f"NE_Status_Raw_{run_tag}.csv"),
+        "diag_log": str(run_dir / f"NE_Status_Diagnostic_{run_tag}.log"),
+    }
+
+def enrich_ne_status_with_vlan_mapping(
+    ne_raw_csv: str,
+    vlan_mapping_path: str,
+    out_excel_path: str,
+    log_func=print
+) -> Dict[str, str]:
+    """Merge NE status CSV with a CE-NE-VLAN mapping and write a single Excel."""
+    status_df = pd.read_csv(ne_raw_csv)
+    map_df = _read_any_table(vlan_mapping_path)
+    # Heuristics for mapping columns
+    name_col = None
+    for c in map_df.columns:
+        if str(c).strip().lower() == "name":
+            name_col = c
+            break
+    if name_col is None:
+        for c in map_df.columns:
+            lc = str(c).lower()
+            if "network" in lc or "vlan" in lc:
+                name_col = c
+                break
+    ne_id_col = None
+    for c in map_df.columns:
+        if str(c).strip().lower() in {"ne_id", "ne", "network_extension", "network extension"}:
+            ne_id_col = c
+            break
+    if ne_id_col is None:
+        for c in map_df.columns:
+            if "ne" in str(c).lower():
+                ne_id_col = c
+                break
+    if name_col is None or ne_id_col is None:
+        raise ValueError(f"Could not detect Name/NE columns in mapping. Columns: {list(map_df.columns)}")
+    # Normalize join keys by network name
+    status_df["__key"] = status_df.get("NetworkName", "").astype(str).str.strip().str.upper()
+    map_df["__key"] = map_df[name_col].astype(str).str.strip().str.upper()
+    # Optional placeholder drop
+    if "IsPlaceholder" in map_df.columns:
+        try:
+            map_df = map_df[~map_df["IsPlaceholder"].fillna(False).astype(bool)].copy()
+        except Exception:
+            pass
+    merged = map_df.merge(status_df, on="__key", how="left", suffixes=("_MAP", "_NE")).drop(columns=["__key"], errors="ignore")
+    # Summary by NE + State
+    if "State" in merged.columns:
+        summary = (
+            merged.groupby(ne_id_col)["State"]
+            .value_counts(dropna=False)
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+    else:
+        summary = merged.groupby(ne_id_col).size().reset_index(name="RowCount")
+    log_func(f"[NE] Writing enriched Excel: {out_excel_path}")
+    with pd.ExcelWriter(out_excel_path, engine="openpyxl") as writer:
+        status_df.drop(columns=["__key"], errors="ignore").to_excel(writer, sheet_name="NE_Status_Raw", index=False)
+        map_df.drop(columns=["__key"], errors="ignore").to_excel(writer, sheet_name="VLAN_Mapping", index=False)
+        merged.to_excel(writer, sheet_name="NE_VLAN_Status", index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+    return {"enriched_excel": out_excel_path}
+
+
+# ==========================================================
+# Dependency Mapping - core loaders
+# ==========================================================
+
+def _read_dependency_export(input_path: str) -> pd.DataFrame:
+    _, ext = os.path.splitext(input_path.lower())
+    if ext == ".csv":
+        df = pd.read_csv(input_path)
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(input_path)
+    else:
+        raise ValueError("Unsupported file type. Select a CSV or Excel file.")
+    df.columns = [str(c).strip() for c in df.columns]
+    if all(c in df.columns for c in REQUIRED_COLUMNS):
+        src_col, dst_col, port_col = REQUIRED_COLUMNS
+    else:
+        def _find_cols(patterns):
+            pats = [p.lower() for p in patterns]
+            matches = []
+            for col in df.columns:
+                low = str(col).lower()
+                if any(p in low for p in pats):
+                    matches.append(col)
+            return matches
+
+        def _pick_best(pattern_groups, banned_terms=None):
+            banned_terms = [b.lower() for b in (banned_terms or [])]
+            for group in pattern_groups:
+                if isinstance(group, str):
+                    group = [group]
+                matches = _find_cols(group)
+                if not matches:
+                    continue
+                if banned_terms and len(matches) > 1:
+                    filtered = [c for c in matches if not any(b in str(c).lower() for b in banned_terms)]
+                    if filtered:
+                        matches = filtered
+                for p in group:
+                    exact = [c for c in matches if str(c).lower().strip() == p.lower().strip()]
+                    if exact:
+                        return sorted(exact, key=lambda c: len(str(c)))[0]
+                return sorted(matches, key=lambda c: len(str(c)))[0]
+            return None
+
+        src_col = _pick_best(["source server name", "source machine name", "source host name", "source hostname", "source host", "source machine"], banned_terms=["arm id"])
+        dst_col = _pick_best(["destination server name", "destination machine name", "destination host name", "destination hostname", "destination host", "destination machine"], banned_terms=["arm id"])
+        port_col = _pick_best(["destination port", "dest port", "remote port", "port"])
+        if not (src_col and dst_col and port_col):
+            raise ValueError(f"Missing required columns: {REQUIRED_COLUMNS}. Found: {list(df.columns)}")
+
+    df = df.dropna(subset=[src_col, dst_col]).copy()
+    df = df.rename(columns={src_col: "Source server name", dst_col: "Destination server name", port_col: "Destination port"})
+    df["Source server name"] = df["Source server name"].map(_normalize_text)
+    df["Destination server name"] = df["Destination server name"].map(_normalize_text)
+    df["Destination port"] = df["Destination port"].map(_normalize_port)
+    df = df.dropna(subset=["Destination port"]).copy()
+    df["Destination port"] = df["Destination port"].astype(str)
+    return df
+
+def _read_dependency_exports(input_paths: Any) -> pd.DataFrame:
+    if isinstance(input_paths, (str, Path)):
+        paths = [str(input_paths)]
+    else:
+        paths = [str(p) for p in input_paths]
+    if not paths:
+        raise ValueError("No dependency files provided.")
+    dfs = [_read_dependency_export(p) for p in paths]
+    return pd.concat(dfs, ignore_index=True)
+
+def process_csv_and_generate_output_df(df: pd.DataFrame, output_csv_basepath: str):
+    df = df.copy()
+    df['Connection Count'] = df.groupby('Source server name')['Destination server name'].transform('nunique')
+    df = df.sort_values(by=['Connection Count', 'Source server name'])
+    unique_rows = set()
+    rows = []
+    for _, r in df.iterrows():
+        key = (r['Source server name'], r['Destination server name'], r['Destination port'])
+        if key not in unique_rows:
+            unique_rows.add(key)
+            rows.append({'Source server name': r['Source server name'], 'Destination server name': r['Destination server name'], 'Destination port': r['Destination port'], 'Connection Count': r['Connection Count']})
+    expanded_df = pd.DataFrame(rows, columns=['Source server name', 'Destination server name', 'Destination port', 'Connection Count'])
+    connection_counts = expanded_df['Connection Count'].value_counts().sort_index()
+    output_csv_path = f"{output_csv_basepath}_grouped.csv"
+    output_viz_path = f"{output_csv_basepath}_connections_viz.png"
+    plt.figure(figsize=(10, 6))
+    connection_counts.plot(kind='bar')
+    plt.title('Number of Source Servers per Connection Count')
+    plt.xlabel('Number of Connections')
+    plt.ylabel('Number of Source Servers')
+    plt.tight_layout()
+    plt.savefig(output_viz_path)
+    plt.close()
+    expanded_df.to_csv(output_csv_path, index=False)
+    return expanded_df, output_csv_path, output_viz_path
+
+def write_all_unique_ports(expanded_df: pd.DataFrame, ports_csv_path: str) -> List[str]:
+    ports = sorted({str(p).strip() for p in expanded_df['Destination port'].dropna().astype(str)})
+    pd.DataFrame([",".join(ports)], columns=["Destination port"]).to_csv(ports_csv_path, index=False)
+    return ports
+
+def determine_complexity(num_servers: int) -> str:
+    if num_servers <= 2:
+        return 'Low'
+    elif 3 <= num_servers <= 4:
+        return 'Medium'
+    else:
+        return 'Complex'
+
+def group_by_source_all_ports_with_groups(input_grouped_csv_path: str):
+    df = pd.read_csv(input_grouped_csv_path, dtype={"Destination port": str})
+    df['Source server name'] = df['Source server name'].map(_normalize_text)
+    df['Destination server name'] = df['Destination server name'].map(_normalize_text)
+    df['Destination port'] = df['Destination port'].astype(str).str.strip()
+    edge_ports = defaultdict(set)
+    source_to_dests = defaultdict(set)
+    for _, r in df.iterrows():
+        src = r['Source server name']
+        dst = r['Destination server name']
+        port = r['Destination port']
+        source_to_dests[src].add(dst)
+        edge_ports[(src, dst)].add(port)
+    rows = []
+    for src, dests in source_to_dests.items():
+        dest_list = sorted(dests)
+        total_servers = 1 + len(dest_list)
+        rows.append({'Application Server': src, 'Dependency Servers': dest_list, 'Total Servers': total_servers, 'Complexity': determine_complexity(total_servers)})
+    grouped_df = pd.DataFrame(rows, columns=['Application Server', 'Dependency Servers', 'Total Servers', 'Complexity'])
+    order = {'Low': 1, 'Medium': 2, 'Complex': 3}
+    grouped_df['Complexity Order'] = grouped_df['Complexity'].map(order)
+    grouped_df = grouped_df.sort_values(by=['Complexity Order', 'Total Servers', 'Application Server'], ascending=[True, True, True]).drop(columns='Complexity Order').reset_index(drop=True)
+    sig_to_group = OrderedDict()
+    groups = []
+    for _, row in grouped_df.iterrows():
+        signature = tuple(row['Dependency Servers'])
+        if signature not in sig_to_group:
+            sig_to_group[signature] = f"Group {len(sig_to_group) + 1}"
+        groups.append(sig_to_group[signature])
+    grouped_df.insert(0, 'Group', groups)
+    base = os.path.splitext(input_grouped_csv_path)[0]
+    complexity_csv_path = base + '_ComplexityGrouping.csv'
+    grouped_df.to_csv(complexity_csv_path, index=False)
+    app_to_group = {row['Application Server']: row['Group'] for _, row in grouped_df.iterrows()}
+    return grouped_df, complexity_csv_path, edge_ports, app_to_group
+
+def inject_search_control(html_path: str):
+    """Inject a small search box into the vis-network HTML."""
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        search_html = r"""
+<div style="position:fixed; top:10px; right:10px; z-index:9999; background:#ffffff; border:1px solid #ccc; padding:6px; font-family:Segoe UI, Arial, sans-serif; font-size:12px;">
+  <label for="nodeSearchInput" style="margin-right:4px;">Find node / group:</label>
+  <input id="nodeSearchInput" type="text" style="width:160px; font-size:12px;" placeholder="e.g. Servername or APP01" />
+  <button onclick="searchNode()" style="font-size:12px;">Go</button>
+</div>
+<script type="text/javascript">
+function searchNode() {
+  var termBox = document.getElementById('nodeSearchInput');
+  if (!termBox) return;
+  var term = termBox.value.toLowerCase();
+  if (!term) return;
+  var foundIds = [];
+  nodes.get().forEach(function(n) {
+    var label = String(n.label || "").toLowerCase();
+    var title = String(n.title || "").toLowerCase();
+    if (label.indexOf(term) !== -1 || title.indexOf(term) !== -1) {
+      foundIds.push(n.id);
+    }
+  });
+  if (foundIds.length > 0) {
+    network.selectNodes(foundIds);
+    network.focus(foundIds[0], {scale:1.3, animation:true});
+  } else {
+    alert('No matching node found for: ' + term);
+  }
+}
+</script>
+"""
+        if "</body>" in html:
+            html = html.replace("</body>", search_html + "\n</body>")
+        else:
+            html += search_html
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        print(f"Failed to inject search box into {html_path}: {e}")
+
+def create_interactive_network_graph(grouped_df: pd.DataFrame, edge_ports_map: Dict[Tuple[str, str], set], app_to_group: Dict[str, str], output_html_path: str):
+    """Build an interactive HTML graph using vis-network directly."""
+    import json
+    nodes_dict: Dict[str, Dict[str, str]] = {}
+    edges_dict: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for _, row in grouped_df.iterrows():
+        app = row["Application Server"]
+        dep_list = row["Dependency Servers"]
+        group_label = row["Group"]
+        app_node_id = f"{group_label} | {app}"
+        if app_node_id not in nodes_dict:
+            nodes_dict[app_node_id] = {"id": app_node_id, "label": app, "title": app, "group": group_label}
+        for dep in dep_list:
+            dep_node_id = f"{group_label} | {dep}"
+            if dep_node_id not in nodes_dict:
+                nodes_dict[dep_node_id] = {"id": dep_node_id, "label": dep, "title": dep, "group": group_label}
+            ports = sorted(edge_ports_map.get((app, dep), set()), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
+            port_text = ", ".join(ports) if ports else "N/A"
+            edge_key = tuple(sorted([app_node_id, dep_node_id]))
+            if edge_key not in edges_dict:
+                edges_dict[edge_key] = {"from": app_node_id, "to": dep_node_id, "title": f"Ports: {port_text}", "label": port_text}
+    nodes = list(nodes_dict.values())
+    edges = list(edges_dict.values())
+    options = {
+        "interaction": {"hover": True},
+        "physics": {"enabled": True, "stabilization": {"enabled": True, "iterations": 200}},
+        "configure": {"enabled": True},
+        "nodes": {"shape": "dot", "size": 16},
+        "edges": {"smooth": True},
+    }
+    html_template = r"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CAFToolKit Dependency Map</title>
+  <style type="text/css">
+    #mynetwork {{
+      width: 1500px;
+      height: 1500px;
+      border: 1px solid lightgray;
+    }}
+  </style>
+  <script type="text/javascript"
+          src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js">
+  </script>
+</head>
+<body>
+<div id="mynetwork"></div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet({nodes_json});
+  var edges = new vis.DataSet({edges_json});
+  var container = document.getElementById('mynetwork');
+  var data = {{nodes: nodes, edges: edges}};
+  var options = {options_json};
+  var network = new vis.Network(container, data, options);
+</script>
+</body>
+</html>
+"""
+    html = html_template.format(nodes_json=json.dumps(nodes), edges_json=json.dumps(edges), options_json=json.dumps(options))
+    output_html_path = os.path.abspath(output_html_path)
+    with open(output_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    inject_search_control(output_html_path)
+
+
+# ------------------------------
+# CMDB helpers (application-based grouping)
+# ------------------------------
+
+def _load_cmdb(cmdb_path: str) -> pd.DataFrame:
+    _, ext = os.path.splitext(cmdb_path.lower())
+    if ext == ".csv":
+        try:
+            df = pd.read_csv(cmdb_path)
+        except UnicodeDecodeError:
+            df = pd.read_csv(cmdb_path, encoding="ISO-8859-1")
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(cmdb_path)
+    else:
+        raise ValueError("Unsupported CMDB file type. Please use CSV or Excel.")
+    if df.empty:
+        raise ValueError("CMDB file appears to be empty.")
+    cols = list(df.columns)
+    col_map = {str(c).strip().lower(): c for c in cols}
+    asset_col = None
+    for key in col_map:
+        if "asset tag" in key or key == "server" or key == "hostname" or "ci name" in key:
+            asset_col = col_map[key]
+            break
+    if asset_col is None and "Asset Tag" in df.columns:
+        asset_col = "Asset Tag"
+    if asset_col is None:
+        raise ValueError("CMDB file must have a column like 'Asset Tag' / 'Server' / 'Hostname'.")
+    app_col = None
+    for key in col_map:
+        if "bsp name" in key or "application" in key or "app name" in key:
+            app_col = col_map[key]
+            break
+    if app_col is None and "BSP Name" in df.columns:
+        app_col = "BSP Name"
+    if app_col is None:
+        raise ValueError("CMDB file must have an application column such as 'BSP Name' / 'Application'.")
+    df = df[[asset_col, app_col]].copy()
+    df.rename(columns={asset_col: "AssetTag", app_col: "Application"}, inplace=True)
+    df["AssetTag_norm"] = df["AssetTag"].astype(str).str.strip().str.upper()
+    df["Application"] = df["Application"].astype(str).str.strip()
+    df = df.dropna(subset=["AssetTag_norm", "Application"])
+    return df
+
+def group_applications_from_edges(edge_ports_map: Dict[Tuple[str, str], set], output_base: str):
+    source_to_dests = defaultdict(set)
+    for (src_app, dst_app), _ports in edge_ports_map.items():
+        source_to_dests[src_app].add(dst_app)
+    rows = []
+    for src_app, dests in source_to_dests.items():
+        dest_list = sorted(dests)
+        total = 1 + len(dest_list)
+        rows.append({"Application": src_app, "Dependency Applications": dest_list, "Total Applications": total, "Complexity": determine_complexity(total)})
+    grouped_df = pd.DataFrame(rows, columns=["Application", "Dependency Applications", "Total Applications", "Complexity"])
+    if grouped_df.empty:
+        complexity_csv_path = f"{output_base}_AppComplexityGrouping.csv"
+        grouped_df.to_csv(complexity_csv_path, index=False)
+        return grouped_df, complexity_csv_path, {}
+    order = {"Low": 1, "Medium": 2, "Complex": 3}
+    grouped_df["Complexity Order"] = grouped_df["Complexity"].map(order)
+    grouped_df = grouped_df.sort_values(by=["Complexity Order", "Total Applications", "Application"], ascending=[True, True, True]).drop(columns="Complexity Order").reset_index(drop=True)
+    sig_to_group = OrderedDict()
+    groups = []
+    for _, row in grouped_df.iterrows():
+        signature = tuple(row["Dependency Applications"])
+        if signature not in sig_to_group:
+            sig_to_group[signature] = f"Group {len(sig_to_group) + 1}"
+        groups.append(sig_to_group[signature])
+    grouped_df.insert(0, "Group", groups)
+    complexity_csv_path = f"{output_base}_AppComplexityGrouping.csv"
+    grouped_df.to_csv(complexity_csv_path, index=False)
+    app_to_group = {row["Application"]: row["Group"] for _, row in grouped_df.iterrows()}
+    return grouped_df, complexity_csv_path, app_to_group
+
+
+# ------------------------------
+# Dependency pipelines
+# ------------------------------
+
+def run_full_dep_pipeline(input_paths: Any, log_func=print) -> Dict[str, str]:
+    cwd = os.getcwd()
+    paths = [str(input_paths)] if isinstance(input_paths, (str, Path)) else [str(p) for p in input_paths]
+    if not paths:
+        raise ValueError("No dependency files provided.")
+    base_stem = os.path.splitext(os.path.basename(paths[0]))[0] + ("_merged" if len(paths) > 1 else "")
+    output_base = os.path.join(cwd, base_stem)
+    log_func(f"[DEP] [1/6] Reading {len(paths)} Azure Migrate dependency file(s)...")
+    for p in paths:
+        log_func(f"[DEP]      - {p}")
+    raw_df = _read_dependency_exports(paths)
+    log_func(f"[DEP]      - Combined rows: {len(raw_df)}")
+    log_func(f"[DEP] [2/6] De-dup + grouped connections & bar chart...")
+    expanded_df, grouped_csv_path, viz_path = process_csv_and_generate_output_df(raw_df, output_base)
+    log_func(f"[DEP]      - Grouped CSV: {grouped_csv_path}")
+    log_func(f"[DEP]      - Chart PNG : {viz_path}")
+    log_func(f"[DEP] [3/6] Writing ALL unique ports (reference)...")
+    ports_all_csv_path = os.path.splitext(grouped_csv_path)[0] + '_unique_ports.csv'
+    all_ports = write_all_unique_ports(expanded_df, ports_all_csv_path)
+    log_func(f"[DEP]      - {len(all_ports)} unique ports")
+    log_func(f"[DEP]      - Ports CSV : {ports_all_csv_path}")
+    log_func(f"[DEP] [4/6] Grouping by Source across ALL ports + Group numbering...")
+    grouped_df, complexity_csv_path, edge_ports, app_to_group = group_by_source_all_ports_with_groups(grouped_csv_path)
+    log_func(f"[DEP]      - Complexity CSV: {complexity_csv_path}")
+    log_func(f"[DEP]      - Groups discovered: {len(set(grouped_df['Group']))}")
+    log_func(f"[DEP] [5/6] Building interactive network (HTML)...")
+    html_path = os.path.splitext(grouped_csv_path)[0] + '_network.html'
+    create_interactive_network_graph(grouped_df, edge_ports, app_to_group, html_path)
+    log_func(f"[DEP]      - HTML graph : {html_path}")
+    log_func(f"[DEP] [6/6] Opening interactive graph in browser...")
+    webbrowser.open('file://' + os.path.abspath(html_path))
+    log_func("[DEP] === Dependency Mapping DONE (HOST-BASED) ===")
+    return {
+        "mode": "HOST_ONLY",
+        "input_files": " ; ".join(paths),
+        "grouped_csv": grouped_csv_path,
+        "ports_all_csv": ports_all_csv_path,
+        "complexity_csv": complexity_csv_path,
+        "chart_png": viz_path,
+        "network_html": html_path
+    }
+
+def run_full_dep_pipeline_with_cmdb(input_paths: Any, cmdb_path: str, log_func=print) -> Dict[str, str]:
+    cwd = os.getcwd()
+    paths = [str(input_paths)] if isinstance(input_paths, (str, Path)) else [str(p) for p in input_paths]
+    if not paths:
+        raise ValueError("No dependency files provided.")
+    base_stem = os.path.splitext(os.path.basename(paths[0]))[0] + ("_merged_CMDB" if len(paths) > 1 else "_CMDB")
+    output_base = os.path.join(cwd, base_stem)
+    log_func(f"[DEP+CMDB] [1/6] Reading {len(paths)} Azure Migrate dependency file(s)...")
+    raw_df = _read_dependency_exports(paths)
+    log_func(f"[DEP+CMDB]      - Combined rows: {len(raw_df)}")
+    log_func(f"[DEP+CMDB] [2/6] Loading CMDB file: {cmdb_path}")
+    cmdb_df = _load_cmdb(cmdb_path)
+    server_to_app: Dict[str, str] = {}
+    for _, row in cmdb_df.iterrows():
+        key = _normalize_hostname_for_matching(row["AssetTag"])
+        if key:
+            server_to_app[key] = row["Application"]
+    log_func(f"[DEP+CMDB]      - CMDB entries with application: {len(server_to_app)}")
+    raw_df = raw_df.copy()
+    raw_df["Source_norm"] = raw_df["Source server name"].map(_normalize_hostname_for_matching)
+    raw_df["Dest_norm"] = raw_df["Destination server name"].map(_normalize_hostname_for_matching)
+    app_edge_ports = defaultdict(set)
+    total_rows = len(raw_df)
+    mapped_rows = 0
+    for _, r in raw_df.iterrows():
+        src_app = server_to_app.get(r["Source_norm"])
+        dst_app = server_to_app.get(r["Dest_norm"])
+        if src_app and dst_app:
+            mapped_rows += 1
+            port = str(r["Destination port"]).strip()
+            app_edge_ports[(src_app, dst_app)].add(port)
+    log_func(f"[DEP+CMDB] [3/6] Mapped {mapped_rows} of {total_rows} rows to application->application edges.")
+    if not app_edge_ports:
+        raise ValueError("No application-to-application mappings generated. Check CMDB vs server names.")
+    edges_rows = [{"Source Application": k[0], "Destination Application": k[1], "Ports": ",".join(sorted(v))} for k, v in app_edge_ports.items()]
+    edges_df = pd.DataFrame(edges_rows, columns=["Source Application", "Destination Application", "Ports"])
+    edges_csv_path = f"{output_base}_AppEdges.csv"
+    edges_df.to_csv(edges_csv_path, index=False)
+    log_func(f"[DEP+CMDB]      - App edges CSV: {edges_csv_path}")
+    log_func(f"[DEP+CMDB] [4/6] Grouping applications into waves based on connectivity...")
+    grouped_df_apps, complexity_csv_path, app_to_group = group_applications_from_edges(app_edge_ports, output_base)
+    log_func(f"[DEP+CMDB]      - App complexity CSV: {complexity_csv_path}")
+    html_path = ""
+    if not grouped_df_apps.empty:
+        host_style_df = grouped_df_apps.rename(columns={"Application": "Application Server", "Dependency Applications": "Dependency Servers"})
+        log_func(f"[DEP+CMDB] [5/6] Building interactive application network (HTML)...")
+        html_path = f"{output_base}_AppNetwork.html"
+        create_interactive_network_graph(host_style_df, app_edge_ports, app_to_group, html_path)
+        log_func(f"[DEP+CMDB]      - HTML app graph: {html_path}")
+    log_func(f"[DEP+CMDB] [6/6] Opening interactive graph in browser...")
+    if html_path:
+        webbrowser.open('file://' + os.path.abspath(html_path))
+    log_func("[DEP+CMDB] === Dependency Mapping DONE (APP-BASED via CMDB) ===")
+    return {
+        "mode": "WITH_CMDB",
+        "input_files": " ; ".join(paths),
+        "cmdb_file": cmdb_path,
+        "app_edges_csv": edges_csv_path,
+        "app_complexity_csv": complexity_csv_path,
+        "app_network_html": html_path
+    }
+
+
+# ==========================================================
+# RVTools helpers and Pre-Migration Health Check
+# ==========================================================
+
+def load_rvtools(path: Path) -> Dict[str, pd.DataFrame]:
+    xl = pd.ExcelFile(path)
+    return {sheet: xl.parse(sheet) for sheet in xl.sheet_names}
+
+def bool_col(df: pd.DataFrame, col_name: str, default: bool = False) -> pd.Series:
+    if col_name in df.columns:
+        return df[col_name].fillna(False).astype(bool)
+    return pd.Series([default] * len(df), index=df.index)
+
+def check_powerstate(vinfo: pd.DataFrame) -> Dict[str, Dict[str, bool]]:
+    col = find_col(vinfo, ["powerstate"])
+    guest_col = find_col(vinfo, ["guest state"])
+    hb_col = find_col(vinfo, ["heartbeat"])
+    cfg_col = find_col(vinfo, ["config status"])
+    results = {}
+    for _, row in vinfo.iterrows():
+        vm = str(row["VM"]).strip()
+        powered_on = bool(col and str(row[col]).lower() == "poweredon")
+        guest_running = bool(guest_col and str(row[guest_col]).lower() == "running")
+        hb_ok = bool(hb_col and str(row[hb_col]).lower() in ["green"])
+        cfg_ok = bool(cfg_col and str(row[cfg_col]).lower() == "green")
+        results[vm] = {"powered_on": powered_on, "guest_running": guest_running, "heartbeat_ok": hb_ok, "config_ok": cfg_ok}
+    return results
+
+def check_vmtools(vtools: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    if vtools is None or vtools.empty:
+        return {}
+    tools_col = find_col(vtools, ["tools"])
+    ver_col = find_col(vtools, ["tools version"])
+    req_col = find_col(vtools, ["required"])
+    results = {}
+    for _, row in vtools.iterrows():
+        vm = str(row["VM"]).strip()
+        tools_state = str(row[tools_col]).lower() if tools_col else ""
+        healthy = (tools_state == "toolsok")
+        outdated = False
+        if ver_col and req_col:
+            try:
+                outdated = int(row[ver_col]) < int(row[req_col])
+            except Exception:
+                outdated = False
+        results[vm] = {"tools_healthy": healthy and not outdated, "tools_state": tools_state, "tools_outdated": outdated}
+    return results
+
+def check_mounted_iso(vcd: Optional[pd.DataFrame], vusb: Optional[pd.DataFrame]) -> Dict[str, bool]:
+    results = {}
+    if vcd is not None and not vcd.empty:
+        for _, row in vcd.iterrows():
+            vm = str(row.get("VM", "")).strip()
+            connected = bool(row.get("Connected", False)) or bool(row.get("Starts Connected", False))
+            if vm and connected:
+                results[vm] = True
+    if vusb is not None and not vusb.empty:
+        for _, row in vusb.iterrows():
+            vm = str(row.get("VM", "")).strip()
+            if vm and bool(row.get("Connected", False)):
+                results[vm] = True
+    return results
+
+def check_disk_multiple_1024(vdisk: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    if vdisk is None or vdisk.empty:
+        return {}
+    cap_col = find_col(vdisk, ["capacity mib"])
+    if not cap_col:
+        return {"_error": "No Capacity column found in vDisk."}
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    for _, row in vdisk.iterrows():
+        vm = str(row.get("VM", "")).strip()
+        disk = row.get("Disk")
+        try:
+            size = int(row[cap_col])
+            aligned = (size % 1024 == 0)
+        except Exception:
+            aligned = False
+        if vm and not aligned:
+            results.setdefault(vm, []).append({"disk": disk, "size_mib": row[cap_col]})
+    return results
+
+def check_partition_free(vpart: Optional[pd.DataFrame], threshold: float = 20.0) -> Dict[str, Any]:
+    if vpart is None or vpart.empty:
+        return {}
+    disk_col = find_col(vpart, ["disk"])
+    free_col = find_col(vpart, ["free %"])
+    if not disk_col or not free_col:
+        return {}
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    for _, row in vpart.iterrows():
+        vm = str(row.get("VM", "")).strip()
+        disk = row.get(disk_col)
+        try:
+            freepct = float(row[free_col])
+        except Exception:
+            continue
+        if vm and freepct < threshold:
+            results.setdefault(vm, []).append({"partition": disk, "free_pct": freepct})
+    return results
+
+def check_recent_backup(vinfo: pd.DataFrame, max_age_days: int = 7) -> Dict[str, Any]:
+    col = find_col(vinfo, ["backup"])
+    if not col:
+        return {"_error": "Backup info not present in RVTools"}
+    results = {}
+    now = datetime.now(timezone.utc)
+    for _, row in vinfo.iterrows():
+        vm = str(row.get("VM", "")).strip()
+        val = str(row.get(col, ""))
+        if not vm:
+            continue
+        if val.lower() == "nan" or val.strip() == "":
+            results[vm] = {"has_backup": False, "message": "No backup info"}
+            continue
+        match = re.search(r'at (.*)', val)
+        if not match:
+            results[vm] = {"has_backup": False, "message": "Unparsable backup info"}
+            continue
+        try:
+            dt = pd.to_datetime(match.group(1), utc=True)
+        except Exception:
+            results[vm] = {"has_backup": False, "message": "Failed to parse backup date"}
+            continue
+        age_days = (now - dt).days
+        ok = age_days <= max_age_days
+        results[vm] = {"has_backup": ok, "age_days": age_days, "backup_datetime": dt}
+    return results
+
+def check_snapshots(vsnap: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    if vsnap is None or vsnap.empty:
+        return {}
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    for _, row in vsnap.iterrows():
+        vm = str(row.get("VM", "")).strip()
+        if not vm:
+            continue
+        results.setdefault(vm, []).append({
+            "snapshot_name": row.get("Name"),
+            "date": row.get("Date / time"),
+            "size_total_mib": row.get("Size MiB (total)")
+        })
+    return results
+
+def extract_vm_networks_from_rvtools(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+    vnet = dfs.get("vNetwork")
+    if vnet is None or vnet.empty:
+        return {}
+    vnet = vnet.copy()
+    vm_col = find_col(vnet, ["vm", "name"])
+    if not vm_col:
+        return {}
+    net_col = None
+    for patt in ["portgroup", "port group", "network", "dvportgroup", "dv portgroup"]:
+        net_col = find_col(vnet, [patt])
+        if net_col:
+            break
+    if not net_col:
+        return {}
+    vnet["VM"] = vnet[vm_col].astype(str).str.strip()
+    vnet["NetworkName"] = vnet[net_col].astype(str).str.strip()
+    vnet = vnet[(vnet["VM"] != "") & (vnet["NetworkName"] != "")]
+    vm_to_nets = {}
+    for vm, sub in vnet.groupby("VM"):
+        nets = sorted({str(x).strip() for x in sub["NetworkName"] if str(x).strip()})
+        vm_to_nets[vm] = nets
+    return vm_to_nets
+
+def run_rvtools_checks(dfs: Dict[str, pd.DataFrame]):
+    vinfo = dfs.get("vInfo")
+    if vinfo is None or vinfo.empty:
+        raise ValueError("RVTools workbook does not contain a non-empty vInfo sheet.")
+    vtools = dfs.get("vTools")
+    vcd = dfs.get("vCD")
+    vusb = dfs.get("vUSB")
+    vdisk = dfs.get("vDisk")
+    vpart = dfs.get("vPartition")
+    vsnap = dfs.get("vSnapshot")
+    vinfo = vinfo.copy()
+    vinfo["VM"] = vinfo["VM"].astype(str).str.strip()
+    vms = sorted(vinfo["VM"].unique())
+    summary = pd.DataFrame(index=vms)
+    power = check_powerstate(vinfo)
+    tools = check_vmtools(vtools)
+    iso = check_mounted_iso(vcd, vusb)
+    disks = check_disk_multiple_1024(vdisk)
+    free = check_partition_free(vpart)
+    backup = check_recent_backup(vinfo)
+    snaps = check_snapshots(vsnap)
+    summary["Powered On"] = [power.get(vm, {}).get("powered_on", False) for vm in vms]
+    summary["Guest Running"] = [power.get(vm, {}).get("guest_running", False) for vm in vms]
+    summary["Heartbeat OK"] = [power.get(vm, {}).get("heartbeat_ok", False) for vm in vms]
+    summary["Config OK"] = [power.get(vm, {}).get("config_ok", False) for vm in vms]
+    summary["VMTools Healthy"] = [tools.get(vm, {}).get("tools_healthy", False) for vm in vms]
+    summary["ISO/Device Attached"] = [vm in iso for vm in vms]
+    summary["Disk Misaligned"] = [vm in disks for vm in vms if vm != "_error"]
+    summary["Low Free Partitions (<20%)"] = [vm in free for vm in vms]
+    summary["Backup OK"] = [backup.get(vm, {}).get("has_backup", False) for vm in vms]
+    summary["Has Snapshots"] = [vm in snaps for vm in vms]
+    return summary, disks, free, iso, snaps
+
+def add_ready_and_reasons(summary: pd.DataFrame) -> pd.DataFrame:
+    powered_on = bool_col(summary, "Powered On")
+    guest_running = bool_col(summary, "Guest Running")
+    heartbeat_ok = bool_col(summary, "Heartbeat OK")
+    config_ok = bool_col(summary, "Config OK")
+    tools_ok = bool_col(summary, "VMTools Healthy")
+    no_iso = ~bool_col(summary, "ISO/Device Attached")
+    no_misaligned = ~bool_col(summary, "Disk Misaligned")
+    no_lowspace = ~bool_col(summary, "Low Free Partitions (<20%)")
+    no_snapshots = ~bool_col(summary, "Has Snapshots")
+    summary["ReadyToMigrate"] = (powered_on & guest_running & heartbeat_ok & config_ok & tools_ok & no_iso & no_misaligned & no_lowspace & no_snapshots)
+    reasons = []
+    for idx in summary.index:
+        r = []
+        if not powered_on[idx]:
+            r.append("VM is not powered on")
+        if not guest_running[idx]:
+            r.append("Guest OS not running")
+        if not heartbeat_ok[idx]:
+            r.append("Heartbeat not green")
+        if not config_ok[idx]:
+            r.append("VM config not healthy")
+        if not tools_ok[idx]:
+            r.append("VMTools not healthy / outdated")
+        if not no_iso[idx]:
+            r.append("Mounted ISO or attached device")
+        if not no_misaligned[idx]:
+            r.append("Disk not multiple of 1024")
+        if not no_lowspace[idx]:
+            r.append("Low free disk space (<20%)")
+        if not no_snapshots[idx]:
+            r.append("Snapshots exist")
+        reasons.append("; ".join(r) if r else "")
+    summary["ReasonNotReady"] = reasons
+    return summary
+
+def load_scoped(scope_path: Path, sheet_name: Optional[str] = None) -> pd.DataFrame:
+    df = pd.read_excel(scope_path, sheet_name=sheet_name, engine="openpyxl") if sheet_name else pd.read_excel(scope_path, engine="openpyxl")
+    if "Server" not in df.columns:
+        raise ValueError('Scoped server file must have a column named "Server".')
+    df["Server"] = df["Server"].astype(str).str.strip()
+    df["Server_UPPER"] = df["Server"].str.upper()
+    return df
+
+def run_premigration_pipeline(rvtools_path: str, scope_path: str, out_path: str, scope_sheet: Optional[str] = None, log_func=print) -> Dict[str, Any]:
+    rvtools_path_p = Path(rvtools_path)
+    scope_path_p = Path(scope_path)
+    out_path_p = Path(out_path)
+    log_func(f"[PRE] Loading RVTools export: {rvtools_path_p}")
+    dfs = load_rvtools(rvtools_path_p)
+    vm_networks = extract_vm_networks_from_rvtools(dfs)
+    summary_all, disks, free, iso, snaps = run_rvtools_checks(dfs)
+    summary_all = add_ready_and_reasons(summary_all)
+    log_func(f"[PRE] Loading scoped server list: {scope_path_p}")
+    scoped = load_scoped(scope_path_p, sheet_name=scope_sheet)
+    summary_reset = summary_all.reset_index().rename(columns={"index": "VM"})
+    summary_reset["VM"] = summary_reset["VM"].astype(str).str.strip()
+    summary_reset["VM_UPPER"] = summary_reset["VM"].str.upper()
+    merged = scoped.merge(summary_reset, left_on="Server_UPPER", right_on="VM_UPPER", how="left", suffixes=("_scope", "_summary"))
+    scoped_found = merged[~merged["VM"].isna()].copy()
+    scoped_not_found = merged[merged["VM"].isna()][["Server"]].drop_duplicates()
+    scoped_vm_set = set(scoped_found["VM"].astype(str).str.strip())
+    disks_scoped = [(vm, issues) for vm, issues in disks.items() if vm in scoped_vm_set and vm != "_error"]
+    free_scoped = [(vm, issues) for vm, issues in free.items() if vm in scoped_vm_set]
+    iso_scoped = [(vm, True) for vm in iso if vm in scoped_vm_set]
+    snaps_scoped = [(vm, issues) for vm, issues in snaps.items() if vm in scoped_vm_set]
+    scoped_found.drop(columns=["Server_UPPER", "VM_UPPER"], errors="ignore", inplace=True)
+    base_pairs = scoped_found[["Server", "VM"]].drop_duplicates()
+    net_rows = []
+    for _, row in base_pairs.iterrows():
+        server = row["Server"]
+        vm = str(row["VM"]).strip()
+        nets = vm_networks.get(vm, [])
+        net_rows.append({"Server": server, "VM": vm, "NetworkCount": len(nets), "Networks": ", ".join(nets)})
+    scoped_networks_df = pd.DataFrame(net_rows, columns=["Server", "VM", "NetworkCount", "Networks"])
+    log_func(f"[PRE] Writing scoped pre-migration report: {out_path_p}")
+    with pd.ExcelWriter(out_path_p, engine="openpyxl") as writer:
+        scoped_found.to_excel(writer, sheet_name="ScopedSummary", index=False)
+        scoped_not_found.to_excel(writer, sheet_name="NotFound", index=False)
+        pd.DataFrame(disks_scoped, columns=["VM", "DiskIssues"]).to_excel(writer, sheet_name="DiskNotAligned_Scoped", index=False)
+        pd.DataFrame(free_scoped, columns=["VM", "LowSpace"]).to_excel(writer, sheet_name="LowFreeSpace_Scoped", index=False)
+        pd.DataFrame(iso_scoped, columns=["VM", "HasDevice"]).to_excel(writer, sheet_name="ISO_Devices_Scoped", index=False)
+        pd.DataFrame(snaps_scoped, columns=["VM", "Snapshots"]).to_excel(writer, sheet_name="Snapshots_Scoped", index=False)
+        scoped_networks_df.to_excel(writer, sheet_name="ScopedNetworks", index=False)
+    found_count = scoped_found["Server"].nunique() if "Server" in scoped_found.columns else len(scoped_found)
+    log_func("[PRE] === Pre-Migration Health Check DONE ===")
+    log_func(f"[PRE] Scoped servers total : {len(scoped)}")
+    log_func(f"[PRE] Found in RVTools     : {found_count}")
+    log_func(f"[PRE] Not found           : {len(scoped_not_found)}")
+    log_func(f"[PRE] Output file         : {out_path_p}")
+    return {"output_excel": str(out_path_p), "scoped_found": int(len(scoped_found)), "scoped_not_found": int(len(scoped_not_found))}
+
+
+# ==========================================================
+# AVS Capacity Assessment
+# ==========================================================
+
+def _build_vm_resources_from_rvtools(dfs: Dict[str, pd.DataFrame], log_func=print):
+    vcpu_df = dfs.get("vCPU")
+    vmem_df = dfs.get("vMemory")
+    vdisk_df = dfs.get("vDisk")
+    if vcpu_df is None or vcpu_df.empty:
+        raise ValueError("RVTools missing 'vCPU' sheet.")
+    if vmem_df is None or vmem_df.empty:
+        raise ValueError("RVTools missing 'vMemory' sheet.")
+    if vdisk_df is None or vdisk_df.empty:
+        raise ValueError("RVTools missing 'vDisk' sheet.")
+    vcpu_df = vcpu_df.copy()
+    vmem_df = vmem_df.copy()
+    vdisk_df = vdisk_df.copy()
+    vcpu_df.columns = [str(c).strip() for c in vcpu_df.columns]
+    vmem_df.columns = [str(c).strip() for c in vmem_df.columns]
+    vdisk_df.columns = [str(c).strip() for c in vdisk_df.columns]
+    vm_col_cpu = find_col(vcpu_df, ["vm", "name"])
+    cpu_col = find_col(vcpu_df, ["cpu", "cpus"])
+    vm_col_mem = find_col(vmem_df, ["vm", "name"])
+    mem_mib_col = find_col(vmem_df, ["size mib", "sizemib"])
+    vm_col_disk = find_col(vdisk_df, ["vm", "name"])
+    cap_mib_col = find_col(vdisk_df, ["capacity mib", "cap mib"])
+    if not all([vm_col_cpu, cpu_col, vm_col_mem, mem_mib_col, vm_col_disk, cap_mib_col]):
+        raise ValueError("RVTools columns are missing in vCPU/vMemory/vDisk.")
+    vcpu_df["VM"] = vcpu_df[vm_col_cpu].astype(str).str.strip()
+    vcpu_df["CPUs"] = pd.to_numeric(vcpu_df[cpu_col], errors="coerce").fillna(0.0)
+    cpu_group = vcpu_df.groupby("VM")["CPUs"].sum().reset_index()
+    vmem_df["VM"] = vmem_df[vm_col_mem].astype(str).str.strip()
+    vmem_df["MemGiB"] = pd.to_numeric(vmem_df[mem_mib_col], errors="coerce").fillna(0.0) / 1024.0
+    mem_group = vmem_df.groupby("VM")["MemGiB"].sum().reset_index()
+    vdisk_df["VM"] = vdisk_df[vm_col_disk].astype(str).str.strip()
+    vdisk_df["ProvTB"] = pd.to_numeric(vdisk_df[cap_mib_col], errors="coerce").fillna(0.0) / (1024.0 * 1024.0)
+    used_mib_col = find_col(vdisk_df, ["used mib", "inuse mib", "used mib (total)", "usedmb", "inuse mib (total)"])
+    if used_mib_col:
+        vdisk_df["UsedTB"] = pd.to_numeric(vdisk_df[used_mib_col], errors="coerce").fillna(0.0) / (1024.0 * 1024.0)
+    else:
+        vdisk_df["UsedTB"] = 0.0
+    disk_group = vdisk_df.groupby("VM")[["ProvTB", "UsedTB"]].sum().reset_index()
+    df_vms = cpu_group.merge(mem_group, on="VM", how="outer").merge(disk_group, on="VM", how="outer").fillna(0.0)
+    return df_vms, vdisk_df
+
+def _calculate_for_node_type(total_vcpu: float, total_mem_gib: float, total_stor_tb: float, node_type_name: str, profile: Dict[str, float]):
+    cores = float(profile["cores"])
+    mem_gib = float(profile["mem_gib"])
+    raw_tb = float(profile["raw_tb"])
+    cpu_overcommit = 4.0
+    cpu_headroom = 20.0
+    esxi_overhead = 10.0
+    mem_headroom = 20.0
+    vsan_slack = 25.0
+    node_cpu_capacity = cores * cpu_overcommit
+    node_cpu_eff = node_cpu_capacity * (1 - cpu_headroom / 100.0)
+    node_mem_eff = mem_gib * (1 - esxi_overhead / 100.0) * (1 - mem_headroom / 100.0)
+    vsan_eff_r1 = 0.50
+    vsan_eff_r5 = 0.75
+
+    def nodes_for_storage(total_tb: float, per_node_raw: float, eff: float, slack: float) -> int:
+        usable = per_node_raw * eff * (1 - slack / 100.0)
+        if usable <= 0:
+            return 0
+        return max(1, math.ceil(total_tb / usable))
+
+    nodes_cpu = max(3, math.ceil(total_vcpu / node_cpu_eff)) if node_cpu_eff > 0 else 3
+    nodes_mem = max(3, math.ceil(total_mem_gib / node_mem_eff)) if node_mem_eff > 0 else 3
+    nodes_stor_r1 = max(3, nodes_for_storage(total_stor_tb, raw_tb, vsan_eff_r1, vsan_slack))
+    nodes_stor_r5 = max(4, nodes_for_storage(total_stor_tb, raw_tb, vsan_eff_r5, vsan_slack))
+
+    def limiting(cpu: int, mem: int, stor: int) -> str:
+        if cpu >= mem and cpu >= stor:
+            return "CPU"
+        if mem >= cpu and mem >= stor:
+            return "Memory"
+        return "Storage"
+
+    rec_r1 = max(nodes_cpu, nodes_mem, nodes_stor_r1)
+    rec_r5 = max(nodes_cpu, nodes_mem, nodes_stor_r5)
+    result_r1 = dict(NodeType=node_type_name, Scenario="FTT1-RAID1 (Mirroring)", Total_vCPU=round(total_vcpu, 2), Total_Mem_GiB=round(total_mem_gib, 2),
+                     Total_Storage_TB=round(total_stor_tb, 2), Nodes_by_CPU=nodes_cpu, Nodes_by_Memory=nodes_mem, Nodes_by_Storage=nodes_stor_r1,
+                     Recommended_Nodes=rec_r1, Limiting_Factor=limiting(nodes_cpu, nodes_mem, nodes_stor_r1))
+    result_r5 = dict(NodeType=node_type_name, Scenario="FTT1-RAID5 (Erasure Coding)", Total_vCPU=round(total_vcpu, 2), Total_Mem_GiB=round(total_mem_gib, 2),
+                     Total_Storage_TB=round(total_stor_tb, 2), Nodes_by_CPU=nodes_cpu, Nodes_by_Memory=nodes_mem, Nodes_by_Storage=nodes_stor_r5,
+                     Recommended_Nodes=rec_r5, Limiting_Factor=limiting(nodes_cpu, nodes_mem, nodes_stor_r5))
+    return result_r1, result_r5
+
+def _calculate_and_write_assessment(df_vms: pd.DataFrame, vdisk_df: pd.DataFrame, total_vcpu: float, total_mem_gib: float, total_stor_tb: float, out_path: Path, mode_label: str, log_func=print):
+    summary_rows = []
+    log_func(f"[ASSM] ({mode_label}) In-scope VMs: {len(df_vms)}")
+    log_func(f"[ASSM] ({mode_label}) Total vCPU     = {total_vcpu:.2f}")
+    log_func(f"[ASSM] ({mode_label}) Total Memory   = {total_mem_gib:.2f} GiB")
+    log_func(f"[ASSM] ({mode_label}) Total Storage  = {total_stor_tb:.2f} TB")
+    for node_type_name, profile in AVS_NODE_TYPES.items():
+        r1, r5 = _calculate_for_node_type(total_vcpu, total_mem_gib, total_stor_tb, node_type_name, profile)
+        r1["Scenario"] = f"{r1['Scenario']} - {mode_label}"
+        r5["Scenario"] = f"{r5['Scenario']} - {mode_label}"
+        summary_rows += [r1, r5]
+    df_summary = pd.DataFrame(summary_rows)
+    log_func(f"[ASSM] ({mode_label}) Writing AVS capacity assessment to: {out_path}")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, index=False, sheet_name="Summary")
+        df_vms.to_excel(writer, index=False, sheet_name="PerVM")
+        vdisk_df.to_excel(writer, index=False, sheet_name="vDisksRaw")
+    return {"output_excel": str(out_path), "summary_rows": int(len(df_summary)), "pervm_rows": int(len(df_vms))}
+
+def run_assessment_pipeline_usedpreferred(rvtools_path: str, out_path: str, log_func=print):
+    dfs = load_rvtools(Path(rvtools_path))
+    df_vms, vdisk_df = _build_vm_resources_from_rvtools(dfs, log_func=log_func)
+    df_vms["SizingTB"] = df_vms.apply(lambda r: r["UsedTB"] if r["UsedTB"] > 0 else r["ProvTB"], axis=1)
+    total_vcpu = float(df_vms["CPUs"].sum())
+    total_mem_gib = float(df_vms["MemGiB"].sum())
+    total_stor_tb = float(df_vms["SizingTB"].sum())
+    return _calculate_and_write_assessment(df_vms, vdisk_df, total_vcpu, total_mem_gib, total_stor_tb, Path(out_path), "UsedPreferred", log_func=log_func)
+
+def run_assessment_pipeline_provisioned(rvtools_path: str, out_path: str, log_func=print):
+    dfs = load_rvtools(Path(rvtools_path))
+    df_vms, vdisk_df = _build_vm_resources_from_rvtools(dfs, log_func=log_func)
+    df_vms["SizingTB"] = df_vms["ProvTB"]
+    total_vcpu = float(df_vms["CPUs"].sum())
+    total_mem_gib = float(df_vms["MemGiB"].sum())
+    total_stor_tb = float(df_vms["SizingTB"].sum())
+    return _calculate_and_write_assessment(df_vms, vdisk_df, total_vcpu, total_mem_gib, total_stor_tb, Path(out_path), "ProvisionedOnly", log_func=log_func)
+
+
+# ==========================================================
+# Azure VM Assessment
+# ==========================================================
+
+AZURE_SIZE_CATALOG = [
+    {"family": "Dsv5", "name": "Standard_D2s_v5",  "vcpus": 2,  "mem_gib": 8},
+    {"family": "Dsv5", "name": "Standard_D4s_v5",  "vcpus": 4,  "mem_gib": 16},
+    {"family": "Dsv5", "name": "Standard_D8s_v5",  "vcpus": 8,  "mem_gib": 32},
+    {"family": "Dsv5", "name": "Standard_D16s_v5", "vcpus": 16, "mem_gib": 64},
+    {"family": "Dsv5", "name": "Standard_D32s_v5", "vcpus": 32, "mem_gib": 128},
+    {"family": "Dsv5", "name": "Standard_D48s_v5", "vcpus": 48, "mem_gib": 192},
+    {"family": "Dsv5", "name": "Standard_D64s_v5", "vcpus": 64, "mem_gib": 256},
+    {"family": "Dsv5", "name": "Standard_D96s_v5", "vcpus": 96, "mem_gib": 384},
+    {"family": "Esv5", "name": "Standard_E2s_v5",  "vcpus": 2,  "mem_gib": 16},
+    {"family": "Esv5", "name": "Standard_E4s_v5",  "vcpus": 4,  "mem_gib": 32},
+    {"family": "Esv5", "name": "Standard_E8s_v5",  "vcpus": 8,  "mem_gib": 64},
+    {"family": "Esv5", "name": "Standard_E16s_v5", "vcpus": 16, "mem_gib": 128},
+    {"family": "Esv5", "name": "Standard_E20s_v5", "vcpus": 20, "mem_gib": 160},
+    {"family": "Esv5", "name": "Standard_E32s_v5", "vcpus": 32, "mem_gib": 256},
+    {"family": "Esv5", "name": "Standard_E48s_v5", "vcpus": 48, "mem_gib": 384},
+    {"family": "Esv5", "name": "Standard_E64s_v5", "vcpus": 64, "mem_gib": 512},
+    {"family": "Esv5", "name": "Standard_E96s_v5", "vcpus": 96, "mem_gib": 672},
+]
+
+def _build_vm_cpu_mem_from_rvtools(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    vcpu_df = dfs.get("vCPU")
+    vmem_df = dfs.get("vMemory")
+    if vcpu_df is None or vcpu_df.empty:
+        raise ValueError("RVTools missing 'vCPU' sheet.")
+    if vmem_df is None or vmem_df.empty:
+        raise ValueError("RVTools missing 'vMemory' sheet.")
+    vcpu_df = vcpu_df.copy()
+    vmem_df = vmem_df.copy()
+    vcpu_df.columns = [str(c).strip() for c in vcpu_df.columns]
+    vmem_df.columns = [str(c).strip() for c in vmem_df.columns]
+    vm_col_cpu = find_col(vcpu_df, ["vm", "name"])
+    cpu_col = find_col(vcpu_df, ["cpu", "cpus"])
+    vm_col_mem = find_col(vmem_df, ["vm", "name"])
+    mem_mib_col = find_col(vmem_df, ["size mib", "sizemib"])
+    if not all([vm_col_cpu, cpu_col, vm_col_mem, mem_mib_col]):
+        raise ValueError("RVTools columns missing in vCPU/vMemory.")
+    vcpu_df["VM"] = vcpu_df[vm_col_cpu].astype(str).str.strip()
+    vcpu_df["vCPU"] = pd.to_numeric(vcpu_df[cpu_col], errors="coerce").fillna(0.0)
+    vmem_df["VM"] = vmem_df[vm_col_mem].astype(str).str.strip()
+    vmem_df["MemGiB"] = pd.to_numeric(vmem_df[mem_mib_col], errors="coerce").fillna(0.0) / 1024.0
+    cpu_group = vcpu_df.groupby("VM")["vCPU"].sum().reset_index()
+    mem_group = vmem_df.groupby("VM")["MemGiB"].sum().reset_index()
+    return cpu_group.merge(mem_group, on="VM", how="outer").fillna(0.0)
+
+def _recommend_azure_size(req_vcpu: float, req_mem_gib: float, allowed_families: set) -> Optional[Dict[str, Any]]:
+    req_vcpu_int = int(math.ceil(req_vcpu))
+    candidates = [s for s in AZURE_SIZE_CATALOG if s["family"] in allowed_families and s["vcpus"] >= req_vcpu_int and s["mem_gib"] >= float(req_mem_gib)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x["vcpus"], x["mem_gib"]))
+    return candidates[0]
+
+def run_azure_vm_assessment_pipeline(rvtools_path: str, out_path: str, family_mode: str = "AUTO", headroom_pct: float = 20.0, log_func=print) -> Dict[str, Any]:
+    if headroom_pct < 0:
+        raise ValueError("Headroom % must be >= 0")
+    allowed = {"Dsv5", "Esv5"} if family_mode.upper() == "AUTO" else ({"Dsv5"} if family_mode.upper() == "DSV5" else {"Esv5"})
+    dfs = load_rvtools(Path(rvtools_path))
+    df = _build_vm_cpu_mem_from_rvtools(dfs)
+    if df.empty:
+        raise ValueError("No VMs found in vCPU/vMemory sheets.")
+    df["HeadroomPct"] = headroom_pct
+    df["Req_vCPU"] = df["vCPU"] * (1.0 + headroom_pct / 100.0)
+    df["Req_MemGiB"] = df["MemGiB"] * (1.0 + headroom_pct / 100.0)
+    rec_names, rec_fams, rec_vcpus, rec_mem, notes = [], [], [], [], []
+    for _, r in df.iterrows():
+        rec = _recommend_azure_size(r["Req_vCPU"], r["Req_MemGiB"], allowed)
+        if rec is None:
+            rec_names.append("")
+            rec_fams.append("")
+            rec_vcpus.append(None)
+            rec_mem.append(None)
+            notes.append("NO_MATCH_IN_CATALOG (extend AZURE_SIZE_CATALOG)")
+        else:
+            rec_names.append(rec["name"])
+            rec_fams.append(rec["family"])
+            rec_vcpus.append(rec["vcpus"])
+            rec_mem.append(rec["mem_gib"])
+            notes.append("")
+    df["RecommendedSize"] = rec_names
+    df["RecommendedFamily"] = rec_fams
+    df["Recommended_vCPU"] = rec_vcpus
+    df["Recommended_MemGiB"] = rec_mem
+    df["Notes"] = notes
+    summary = (df[df["RecommendedSize"].astype(str).str.strip() != ""]
+               .groupby(["RecommendedFamily", "RecommendedSize"]).size()
+               .reset_index(name="VMCount")
+               .sort_values(["RecommendedFamily", "VMCount"], ascending=[True, False]))
+    not_mapped = df[df["RecommendedSize"].astype(str).str.strip() == ""].copy()
+    catalog_df = pd.DataFrame(AZURE_SIZE_CATALOG)
+    out_path_p = Path(out_path)
+    log_func(f"[AZURE] Writing Azure VM assessment to: {out_path_p}")
+    with pd.ExcelWriter(out_path_p, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        df.to_excel(writer, sheet_name="PerVM", index=False)
+        not_mapped.to_excel(writer, sheet_name="NotMapped", index=False)
+        catalog_df.to_excel(writer, sheet_name="CatalogUsed", index=False)
+    return {"output_excel": str(out_path_p), "vms_total": int(len(df)), "vms_sized": int(len(df) - len(not_mapped)), "vms_not_mapped": int(len(not_mapped))}
+
+
+# ==========================================================
+# Large VMs Report
+# ==========================================================
+
+def run_largevm_pipeline(rvtools_path: str, threshold_tb: float, output_dir: str, log_func=print) -> Dict[str, Any]:
+    if threshold_tb <= 0:
+        raise ValueError("Threshold TB must be greater than 0.")
+    dfs = load_rvtools(Path(rvtools_path))
+    df_vms, _vdisk_df = _build_vm_resources_from_rvtools(dfs, log_func=log_func)
+    df_large = df_vms[df_vms["ProvTB"] >= threshold_tb].copy()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    output_dir_p = Path(output_dir)
+    output_dir_p.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir_p / f"LargeVMs_{threshold_tb}TB_{ts}.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_large.to_excel(writer, index=False, sheet_name="LargeVMs")
+        df_vms.to_excel(writer, index=False, sheet_name="AllVMs")
+    log_func(f"[LARGE] Large VMs report written to: {out_path}")
+    return {"output_excel": str(out_path), "large_vm_count": int(len(df_large))}
+
+
+# ==========================================================
+# Post-Migration Validation (Ping + Traceroute)
+# ==========================================================
+
+def run_ping(server: str, count: int = 2, timeout: int = 3):
+    if os.name == "nt":
+        cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), server]
+    else:
+        cmd = ["ping", "-c", str(count), "-W", str(timeout), server]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * count + 5)
+        success = (completed.returncode == 0)
+        output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    except Exception as e:
+        success = False
+        output = f"ERROR running ping: {e}"
+    return success, output
+
+def run_traceroute(server: str, max_hops: int = 20, timeout: int = 60):
+    if os.name == "nt":
+        cmd = ["tracert", "-d", "-h", str(max_hops), server]
+    else:
+        cmd = ["traceroute", "-n", "-m", str(max_hops), server]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        success = (completed.returncode == 0)
+        output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    except Exception as e:
+        success = False
+        output = f"ERROR running traceroute: {e}"
+    return success, output
+
+def run_postmigration_pipeline(scope_path: str, out_path: str, log_func=print) -> Dict[str, Any]:
+    scoped = load_scoped(Path(scope_path), sheet_name=None)
+    servers = sorted(set(scoped["Server"].astype(str).str.strip()))
+    servers = [s for s in servers if s]
+    rows = []
+    for server in servers:
+        log_func(f"[POST] Pinging {server} ...")
+        ping_ok, ping_out = run_ping(server)
+        log_func(f"[POST] Traceroute {server} ...")
+        trace_ok, trace_out = run_traceroute(server)
+        rows.append({"Server": server, "PingSuccess": ping_ok, "TracerouteSuccess": trace_ok, "PingOutput": ping_out, "TracerouteOutput": trace_out})
+    df = pd.DataFrame(rows)
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path_p, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="PostMigrationStatus", index=False)
+    success_count = sum(1 for r in rows if r["PingSuccess"])
+    return {"output_excel": str(out_path_p), "servers_total": int(len(servers)), "ping_success": int(success_count)}
+
+
+# ==========================================================
+# UI (Tkinter)
+# ==========================================================
+
+def _add_contact_banner(parent, bg_color="#F0F0F0"):
+    """Add a contact info banner to the top of every tab."""
+    banner = tk.Frame(parent, bg=bg_color, relief="groove", bd=1)
+    banner.pack(fill=tk.X, pady=(0, 4))
+    tk.Label(
+        banner,
+        text=CONTACT_NOTE,
+        bg=bg_color, fg="#333333",
+        font=("Segoe UI", 8, "italic"),
+        justify="left",
+        anchor="w",
+    ).pack(anchor="w", padx=6, pady=2)
+
+
+class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CAFToolKit - Cloud Adoption Framework Toolkit by Satish Loyapally")
+        self.minsize(1100, 750)
+
+        # shared state for Dependency Mapping
+        self.file_path = tk.StringVar(value="")
+        self.dep_files: List[str] = []
+        self.dep_mode_var = tk.StringVar(value="HOST_ONLY")
+        self.cmdb_path_var = tk.StringVar(value="")
+
+        # Pre-migration UI state
+        self.rvtools_path_var = tk.StringVar(value=RVTOOLS_DEFAULT)
+        self.scope_path_var = tk.StringVar(value=SCOPE_DEFAULT)
+        self.out_pre_path_var = tk.StringVar(value=OUT_PRE_DEFAULT)
+
+        # AVS Assessment UI state
+        self.assess_rvtools_var = tk.StringVar(value=RVTOOLS_DEFAULT)
+        self.assess_out_var = tk.StringVar(value=OUT_ASSESS_DEFAULT)
+        self.assess_mode_var = tk.StringVar(value="UsedPreferred")
+
+        # Azure VM Assessment UI state
+        self.azure_rvtools_var = tk.StringVar(value=RVTOOLS_DEFAULT)
+        self.azure_out_var = tk.StringVar(value=OUT_AZURE_ASSESS_DEFAULT)
+        self.azure_family_var = tk.StringVar(value="AUTO")
+        self.azure_headroom_var = tk.StringVar(value="20")
+
+        # HCX UI state
+        self.hcx_server_var = tk.StringVar(value="")
+        self.hcx_user_var = tk.StringVar(value="")
+        self.hcx_pass_var = tk.StringVar(value="")
+        self.hcx_output_dir_var = tk.StringVar(value=r"C:\temp")
+        self.hcx_group_ids_var = tk.StringVar(value="")
+        self.hcx_group_names_var = tk.StringVar(value="")
+        self.hcx_groupid_file_var = tk.StringVar(value="")
+
+        # NE Status UI state
+        self.ne_output_dir_var = tk.StringVar(value=r"C:\temp")
+        self.ne_name_contains_var = tk.StringVar(value="")
+        self.ne_ids_var = tk.StringVar(value="")
+        self.ne_vlan_map_var = tk.StringVar(value="")
+
+        # Large VMs UI state
+        self.large_rvtools_var = tk.StringVar(value=RVTOOLS_DEFAULT)
+        self.large_threshold_var = tk.StringVar(value="1.0")
+        self.large_output_dir_var = tk.StringVar(value=LARGEVMS_OUT_DEFAULT)
+
+        # Post-migration UI state
+        self.post_scope_path_var = tk.StringVar(value=SCOPE_DEFAULT)
+        self.post_out_path_var = tk.StringVar(value=POSTMIG_OUT_DEFAULT)
+
+        # NSX-T to NSG UI state
+        self.nsx_files: List[str] = []
+        self.nsx_files_var = tk.StringVar(value="")
+        self.nsx_out_var = tk.StringVar(value=NSX_OUT_DEFAULT)
+        self.nsx_pass_only_var = tk.BooleanVar(value=True)
+        self.nsx_threshold_var = tk.StringVar(value="20")
+
+        self.msg_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+
+        root = ttk.Frame(self, padding=16)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(root, text="CAFToolKit", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            root,
+            text=(
+                "Welcome | Dependency Mapping | Pre-Migration Health | AVS Assessment | Azure VM Assessment\n"
+                "NE Status | HCX Status | Large VMs | Post-Migration Validation | NSX-T to NSG Mapping"
+            ),
+            justify="left"
+        ).pack(anchor="w", pady=(0, 10))
+
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        welcome_frame = ttk.Frame(notebook)
+        dep_frame = ttk.Frame(notebook)
+        pre_frame = ttk.Frame(notebook)
+        assess_frame = ttk.Frame(notebook)
+        azure_frame = ttk.Frame(notebook)
+        ne_frame = ttk.Frame(notebook)
+        hcx_frame = ttk.Frame(notebook)
+        large_frame = ttk.Frame(notebook)
+        post_frame = ttk.Frame(notebook)
+        nsx_frame = ttk.Frame(notebook)
+
+        notebook.add(welcome_frame, text="Welcome & Runbook")
+        notebook.add(dep_frame, text="Dependency Mapping")
+        notebook.add(pre_frame, text="Pre-Migration Health Check")
+        notebook.add(assess_frame, text="AVS Capacity Assessment")
+        notebook.add(azure_frame, text="Azure VM Assessment")
+        notebook.add(ne_frame, text="NE Status")
+        notebook.add(hcx_frame, text="HCX Status")
+        notebook.add(large_frame, text="Large VMs")
+        notebook.add(post_frame, text="Post-Migration Validation")
+        notebook.add(nsx_frame, text="NSX-T to NSG")
+
+        self._build_welcome_tab(welcome_frame)
+        self._build_dep_tab(dep_frame)
+        self._build_pre_tab(pre_frame)
+        self._build_assess_tab(assess_frame)
+        self._build_azure_assess_tab(azure_frame)
+        self._build_ne_tab(ne_frame)
+        self._build_hcx_tab(hcx_frame)
+        self._build_large_tab(large_frame)
+        self._build_post_tab(post_frame)
+        self._build_nsx_tab(nsx_frame)
+
+        ttk.Label(root, text="Log:").pack(anchor="w", pady=(8, 0))
+        self.log = scrolledtext.ScrolledText(root, height=12, wrap="word", state="disabled")
+        self.log.pack(fill=tk.BOTH, expand=True)
+
+        self.after(100, self._drain_queue)
+
+    # ------------------------------
+    # Queue / logging
+    # ------------------------------
+    def _enqueue_log(self, msg: str):
+        self.msg_queue.put(("log", msg))
+
+    def _enqueue_call(self, func, *args, **kwargs):
+        self.msg_queue.put(("call", (func, args, kwargs)))
+
+    def _drain_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "log":
+                    self._log_to_text(payload)
+                elif kind == "call":
+                    func, args, kwargs = payload
+                    func(*args, **kwargs)
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_queue)
+
+    def _log_to_text(self, msg: str):
+        self.log.configure(state="normal")
+        self.log.insert(tk.END, msg + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state="disabled")
+
+    # ------------------------------
+    # Welcome & Runbook tab
+    # ------------------------------
+    def _build_welcome_tab(self, parent):
+        # Scrollable canvas for the runbook content
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind mousewheel
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # --- Header ---
+        header = tk.Frame(scroll_frame, bg="#1565C0")
+        header.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(header, text="CAFToolKit - Cloud Adoption Framework Toolkit",
+                 bg="#1565C0", fg="white", font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        tk.Label(header, text="Your all-in-one migration assessment & validation companion",
+                 bg="#1565C0", fg="#BBDEFB", font=("Segoe UI", 10)).pack(anchor="w", padx=10, pady=(0, 10))
+
+        # --- Contact ---
+        contact_frame = tk.Frame(scroll_frame, bg="#E3F2FD", relief="ridge", bd=2)
+        contact_frame.pack(fill=tk.X, padx=10, pady=(0, 12))
+        tk.Label(contact_frame, text="Contact Information",
+                 bg="#E3F2FD", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        tk.Label(contact_frame,
+                 text=(f"Author & Maintainer: {AUTHOR_NAME}\n"
+                       f"Email: {AUTHOR_EMAIL}\n\n"
+                       "For any issues, enhancements, feature requests, or feedback regarding CAFToolKit,\n"
+                       f"please reach out to {AUTHOR_NAME} at {AUTHOR_EMAIL}.\n"
+                       "Your feedback helps improve the tool for everyone!"),
+                 bg="#E3F2FD", font=("Segoe UI", 10), justify="left").pack(anchor="w", padx=8, pady=(2, 8))
+
+        # --- Runbook ---
+        runbook_label = tk.Label(scroll_frame, text="Step-by-Step Runbook",
+                                 font=("Segoe UI", 14, "bold"), anchor="w")
+        runbook_label.pack(anchor="w", padx=10, pady=(4, 8))
+
+        runbook_text = (
+            "=== HOW TO USE CAFToolKit ===\n"
+            "\n"
+            "This toolkit provides 9 specialized modules for cloud migration planning,\n"
+            "assessment, execution, and validation. Below is a step-by-step guide for each tab.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 1: DEPENDENCY MAPPING (Azure Migrate)\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Analyze server-to-server dependencies from Azure Migrate exports.\n"
+            "Steps:\n"
+            "  1. Click 'Browse...' or drag & drop one or more Azure Migrate dependency\n"
+            "     CSV or Excel files into the drop zone.\n"
+            "  2. Choose grouping mode:\n"
+            "     - Server-based: groups by hostname (no CMDB needed)\n"
+            "     - Application-based: maps servers to applications via CMDB\n"
+            "  3. If Application-based, browse and select a CMDB file\n"
+            "     (must have 'Asset Tag'/'Hostname' + 'BSP Name'/'Application' columns).\n"
+            "  4. Click 'Run Dependency Mapping'.\n"
+            "  5. Outputs: grouped CSV, complexity grouping, unique ports CSV,\n"
+            "     bar chart PNG, and interactive HTML network graph (opens in browser).\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 2: PRE-MIGRATION HEALTH CHECK\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Validate VM readiness using RVTools + a scoped server list.\n"
+            "Steps:\n"
+            "  1. Browse to select your RVTools export (.xlsx).\n"
+            "  2. Browse to select your scoped server list\n"
+            "     (Excel with a 'Server' column).\n"
+            "  3. Choose output Excel file path.\n"
+            "  4. Click 'Run Pre-Migration Check'.\n"
+            "  5. Output Excel contains: ScopedSummary (with ReadyToMigrate flag),\n"
+            "     NotFound servers, DiskNotAligned, LowFreeSpace, ISO/Devices,\n"
+            "     Snapshots, and ScopedNetworks sheets.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 3: AVS CAPACITY ASSESSMENT\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Calculate AVS node requirements for all node types.\n"
+            "Steps:\n"
+            "  1. Browse to select your RVTools export (needs vCPU, vMemory, vDisk sheets).\n"
+            "  2. Choose sizing mode:\n"
+            "     - UsedPreferred: uses actual used disk if available, else provisioned\n"
+            "     - ProvisionedOnly: uses full provisioned disk size\n"
+            "  3. Choose output Excel file path.\n"
+            "  4. Click 'Run AVS Assessment'.\n"
+            "  5. Output Excel contains: Summary (all node types x RAID1/RAID5),\n"
+            "     PerVM breakdown, and raw vDisk data.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 4: AZURE VM ASSESSMENT\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Recommend Azure VM sizes (Dsv5/Esv5) from RVTools data.\n"
+            "Steps:\n"
+            "  1. Browse to select your RVTools export.\n"
+            "  2. Choose family mode: AUTO (both), DSV5 only, or ESV5 only.\n"
+            "  3. Set headroom % (default 20%).\n"
+            "  4. Choose output Excel path.\n"
+            "  5. Click 'Run Azure VM Assessment'.\n"
+            "  6. Output Excel: Summary, PerVM recommendations, NotMapped VMs,\n"
+            "     and the catalog used.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 5: NE STATUS (HCX Network Extension)\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Pull HCX Network Extension status for L2 extensions.\n"
+            "Steps:\n"
+            "  1. Enter HCX Server FQDN/IP, Username, and Password.\n"
+            "  2. Choose output folder.\n"
+            "  3. (Optional) Filter by NE name or NE IDs.\n"
+            "  4. (Optional) Provide a CE-NE-VLAN mapping file for enrichment.\n"
+            "  5. Click 'Run NE Status Pull'.\n"
+            "  6. Outputs: raw NE status CSV, diagnostic log, and (if mapping\n"
+            "     provided) an enriched Excel with merged VLAN data.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 6: HCX STATUS (Migration Status)\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Pull HCX migration status for mobility groups.\n"
+            "Steps:\n"
+            "  1. Enter HCX Server FQDN/IP, Username, and Password.\n"
+            "  2. Choose output folder.\n"
+            "  3. (Optional) Filter by Group IDs, Group Name patterns,\n"
+            "     or a Group ID file (one ID per line).\n"
+            "  4. Click 'Run HCX Status Pull'.\n"
+            "  5. Outputs: Groups CSV, selected IDs, raw status CSV,\n"
+            "     enriched status CSV, and diagnostic log.\n"
+            "  Note: Requires Windows + VMware PowerCLI (auto-installed if missing).\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 7: LARGE VMs REPORT\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Identify VMs exceeding a disk size threshold.\n"
+            "Steps:\n"
+            "  1. Browse to select your RVTools export.\n"
+            "  2. Enter threshold in TB (e.g., 1.0 for VMs >= 1 TB).\n"
+            "  3. Choose output folder.\n"
+            "  4. Click 'Run Large VMs Report'.\n"
+            "  5. Output Excel: LargeVMs sheet + AllVMs reference sheet.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 8: POST-MIGRATION VALIDATION\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Validate connectivity after cutover via Ping + Traceroute.\n"
+            "Steps:\n"
+            "  1. Browse to select your scoped server list (with 'Server' column).\n"
+            "  2. Choose output Excel path.\n"
+            "  3. Click 'Run Post-Migration Validation'.\n"
+            "  4. Output Excel: PostMigrationStatus with ping/traceroute results.\n"
+            "  Tip: Run this from a machine with network access to target servers.\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "TAB 9: NSX-T TO AZURE NSG MAPPING\n"
+            "---------------------------------------------------------------\n"
+            "Purpose: Analyze NSX-T firewall logs and propose Azure NSG rules.\n"
+            "Steps:\n"
+            "  1. Click 'Browse...' to select one or more NSX-T log exports\n"
+            "     (CSV or Excel). Required columns: Timestamp, RuleId, Action,\n"
+            "     Direction, Protocol, SourceIp, DestinationIp, SourcePort,\n"
+            "     DestinationPort.\n"
+            "  2. Choose output folder.\n"
+            "  3. Configure options:\n"
+            "     - 'Proposed rules from PASS only': only generate NSG rules\n"
+            "       for PASS actions (recommended).\n"
+            "     - 'Source aggregation threshold': if a destination port has\n"
+            "       more unique source IPs than this number, aggregate to /24.\n"
+            "  4. Click 'Run NSX-T to NSG Analysis'.\n"
+            "  5. Outputs (all CSV):\n"
+            "     - Input_Summary.csv: overview of each input file\n"
+            "     - RuleId_Hits.csv: rule hit counts\n"
+            "     - Dest_Port_Analysis.csv: destination/port breakdown\n"
+            "     - Top_Flows_Top2000.csv: top 2000 flows\n"
+            "     - Proposed_NSG_Rules.csv: ready-to-use NSG rule proposals\n"
+            "\n"
+            "---------------------------------------------------------------\n"
+            "GENERAL TIPS\n"
+            "---------------------------------------------------------------\n"
+            "  - All tabs show progress in the Log panel at the bottom.\n"
+            "  - Drag & drop is supported if tkinterdnd2 is installed.\n"
+            "  - PowerShell-based tabs (HCX, NE) require Windows.\n"
+            "  - Update the default file paths in the script if needed.\n"
+            "  - For multi-file inputs, use the Browse dialog (multi-select).\n"
+            "\n"
+            f"For any issues or feedback: {AUTHOR_NAME} ({AUTHOR_EMAIL})\n"
+        )
+
+        text_widget = tk.Text(scroll_frame, wrap="word", font=("Consolas", 9),
+                              bg="#FAFAFA", fg="#212121", relief="flat",
+                              padx=12, pady=8, height=35)
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        text_widget.insert("1.0", runbook_text)
+        text_widget.configure(state="disabled")
+
+    # ------------------------------
+    # Dependency Mapping tab
+    # ------------------------------
+    def _build_dep_tab(self, parent):
+        _add_contact_banner(parent, "#FFF9C4")
+
+        header = tk.Frame(parent, bg="#FFF9C4")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="Dependency Mapping (Azure Migrate - multi-file, with/without CMDB)", bg="#FFF9C4", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+
+        ttk.Label(
+            parent,
+            text=("1) Drag & drop or browse for one or more Azure Migrate dependency CSV/Excel files\n"
+                  "2) Choose grouping mode: Host-based only OR Application-based (Azure Migrate + CMDB)\n"
+                  "3) (If CMDB mode) select CMDB file with Asset Tag + Application mapping\n"
+                  "4) Click Run to generate groups, complexity and interactive network graph.\n\n"
+                  "Tip: you can multi-select Azure Migrate files in the Browse dialog (for split exports)."),
+            justify="left"
+        ).pack(anchor="w", pady=(0, 8))
+
+        mode_row = ttk.Frame(parent); mode_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(mode_row, text="Grouping mode:").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="Server-based (Azure Migrate only)", variable=self.dep_mode_var, value="HOST_ONLY").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(mode_row, text="Application-based (Azure Migrate + CMDB)", variable=self.dep_mode_var, value="WITH_CMDB").pack(side=tk.LEFT, padx=(8, 0))
+
+        dz_frame = ttk.Frame(parent); dz_frame.pack(fill=tk.X, pady=(8, 8))
+        self.drop_label = ttk.Label(dz_frame, text="Drop Azure Migrate dependency file(s) here", relief="ridge", anchor="center")
+        self.drop_label.pack(fill=tk.X, padx=2, pady=2, ipady=16)
+        if _DND_AVAILABLE:
+            self.drop_label.drop_target_register(DND_FILES)
+            self.drop_label.dnd_bind("<<Drop>>", self._on_drop_dep)
+        else:
+            self.drop_label.config(text="Drag & drop unavailable. Use Browse... (multi-select enabled)")
+
+        file_row = ttk.Frame(parent); file_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Entry(file_row, textvariable=self.file_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(file_row, text="Browse...", command=self._browse_dep).pack(side=tk.LEFT, padx=(8, 0))
+
+        cmdb_row = ttk.Frame(parent); cmdb_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(cmdb_row, text="CMDB file (for Application-based mode):").pack(side=tk.LEFT)
+        ttk.Entry(cmdb_row, textvariable=self.cmdb_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(cmdb_row, text="Browse CMDB...", command=self._browse_cmdb).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_dep_btn = ttk.Button(controls, text="Run Dependency Mapping", command=self._run_dep_pipeline_threaded)
+        self.run_dep_btn.pack(side=tk.LEFT)
+        self.dep_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.dep_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _set_dep_selected(self, paths):
+        if isinstance(paths, (list, tuple)):
+            valid_paths = [p for p in paths if os.path.isfile(p)]
+            self.dep_files = valid_paths
+            if valid_paths:
+                self.file_path.set(" ; ".join(valid_paths))
+                self.drop_label.config(text="Selected: " + " ; ".join(os.path.basename(p) for p in valid_paths))
+            else:
+                self.dep_files = []
+                self.file_path.set("")
+                self.drop_label.config(text="Drop Azure Migrate dependency file(s) here")
+        else:
+            p = str(paths)
+            if os.path.isfile(p):
+                self.dep_files = [p]
+                self.file_path.set(p)
+                self.drop_label.config(text=f"Selected: {os.path.basename(p)}")
+            else:
+                self.dep_files = []
+                self.file_path.set("")
+                self.drop_label.config(text="Drop Azure Migrate dependency file(s) here")
+
+    def _on_drop_dep(self, event):
+        data = event.data
+        paths = []
+        if data.strip().startswith("{"):
+            parts, buf, brace = [], "", False
+            for ch in data:
+                if ch == "{": brace, buf = True, ""
+                elif ch == "}":
+                    brace = False
+                    if buf: parts.append(buf); buf = ""
+                elif brace: buf += ch
+                elif ch == " " and not brace:
+                    if buf: parts.append(buf); buf = ""
+                else: buf += ch
+            if buf: parts.append(buf)
+            for p in parts:
+                if os.path.isfile(p): paths.append(p)
+        else:
+            for token in data.split():
+                if os.path.isfile(token): paths.append(token)
+        if paths:
+            self._set_dep_selected(paths)
+        else:
+            messagebox.showerror("Invalid file(s)", f"Couldn't read dropped item(s):\n{data}")
+
+    def _browse_dep(self):
+        fps = filedialog.askopenfilenames(title="Select Azure Migrate Dependency Export(s)", filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fps: self._set_dep_selected(list(fps))
+
+    def _browse_cmdb(self):
+        fp = filedialog.askopenfilename(title="Select CMDB file (Asset Tag + Application)", filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.cmdb_path_var.set(fp)
+
+    def _run_dep_pipeline_threaded(self):
+        paths = list(self.dep_files)
+        if not paths:
+            raw = self.file_path.get().strip()
+            if raw:
+                candidates = [p.strip() for p in raw.split(";") if p.strip()]
+                paths = [p for p in candidates if os.path.isfile(p)]
+        if not paths:
+            messagebox.showerror("No file", "Please select one or more Azure Migrate dependency files first."); return
+        mode = self.dep_mode_var.get()
+        cmdb_path = self.cmdb_path_var.get().strip()
+        if mode == "WITH_CMDB":
+            if not cmdb_path or not os.path.isfile(cmdb_path):
+                messagebox.showerror("CMDB file", "Please select a valid CMDB file for Application-based mode."); return
+        self.run_dep_btn.configure(state="disabled")
+        self.dep_progress.start(15)
+        self._enqueue_log(f"[DEP] Starting dependency mapping in mode: {mode} ({len(paths)} file(s))")
+        def work():
+            try:
+                outputs = run_full_dep_pipeline_with_cmdb(paths, cmdb_path, log_func=self._enqueue_log) if mode == "WITH_CMDB" else run_full_dep_pipeline(paths, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_dep_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_dep_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_dep_success(self, outputs: dict):
+        self.dep_progress.stop()
+        self.run_dep_btn.configure(state="normal")
+        self._enqueue_log("[DEP] Outputs:")
+        for k, v in outputs.items(): self._enqueue_log(f"[DEP]  - {k}: {v}")
+        messagebox.showinfo("Dependency Mapping", "Pipeline completed.\nInteractive graph should be open in your browser.")
+
+    def _on_dep_error(self, msg: str):
+        self.dep_progress.stop()
+        self.run_dep_btn.configure(state="normal")
+        self._enqueue_log(f"[DEP] ERROR: {msg}")
+        messagebox.showerror("Dependency Mapping Error", msg)
+
+    # ------------------------------
+    # Pre-Migration tab
+    # ------------------------------
+    def _build_pre_tab(self, parent):
+        _add_contact_banner(parent, "#BBDEFB")
+
+        header = tk.Frame(parent, bg="#BBDEFB")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="Pre-Migration Health Check (RVTools + Scoped Servers)", bg="#BBDEFB", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text="1) Select RVTools export (XLSX)\n2) Select scoped server list (must have 'Server' column)\n3) Choose output Excel path\n4) Click Run.", justify="left").pack(anchor="w", pady=(0, 8))
+
+        rv_row = ttk.Frame(parent); rv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(rv_row, text="RVTools file:").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.rvtools_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(rv_row, text="Browse...", command=self._browse_rvtools).pack(side=tk.LEFT, padx=(8, 0))
+
+        sc_row = ttk.Frame(parent); sc_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(sc_row, text="Scoped servers:").pack(side=tk.LEFT)
+        ttk.Entry(sc_row, textvariable=self.scope_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(sc_row, text="Browse...", command=self._browse_scoped).pack(side=tk.LEFT, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output Excel:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.out_pre_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_out_pre).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_pre_btn = ttk.Button(controls, text="Run Pre-Migration Check", command=self._run_pre_pipeline_threaded)
+        self.run_pre_btn.pack(side=tk.LEFT)
+        self.pre_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.pre_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_rvtools(self):
+        fp = filedialog.askopenfilename(title="Select RVTools Excel (.xlsx)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.rvtools_path_var.set(fp)
+
+    def _browse_scoped(self):
+        fp = filedialog.askopenfilename(title="Select Scoped Servers Excel (must have 'Server' column)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.scope_path_var.set(fp)
+
+    def _browse_out_pre(self):
+        fp = filedialog.asksaveasfilename(title="Select output Excel file", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if fp: self.out_pre_path_var.set(fp)
+
+    def _run_pre_pipeline_threaded(self):
+        rv = self.rvtools_path_var.get().strip()
+        sc = self.scope_path_var.get().strip()
+        out = self.out_pre_path_var.get().strip()
+        if not os.path.isfile(rv): messagebox.showerror("RVTools file", f"RVTools file not found:\n{rv}"); return
+        if not os.path.isfile(sc): messagebox.showerror("Scoped file", f"Scoped servers file not found:\n{sc}"); return
+        if not out: messagebox.showerror("Output path", "Please select output Excel path."); return
+        self.run_pre_btn.configure(state="disabled")
+        self.pre_progress.start(15)
+        self._enqueue_log(f"[PRE] Starting pre-migration health check...")
+        def work():
+            try:
+                outputs = run_premigration_pipeline(rv, sc, out, scope_sheet=None, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_pre_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_pre_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pre_success(self, outputs: dict):
+        self.pre_progress.stop()
+        self.run_pre_btn.configure(state="normal")
+        self._enqueue_log("[PRE] Outputs:")
+        for k, v in outputs.items(): self._enqueue_log(f"[PRE]  - {k}: {v}")
+        messagebox.showinfo("Pre-Migration Health Check", f"Completed.\nOutput: {outputs.get('output_excel')}")
+
+    def _on_pre_error(self, msg: str):
+        self.pre_progress.stop()
+        self.run_pre_btn.configure(state="normal")
+        self._enqueue_log(f"[PRE] ERROR: {msg}")
+        messagebox.showerror("Pre-Migration Error", msg)
+
+    # ------------------------------
+    # AVS Capacity Assessment tab
+    # ------------------------------
+    def _build_assess_tab(self, parent):
+        _add_contact_banner(parent, "#C8E6C9")
+
+        header = tk.Frame(parent, bg="#C8E6C9")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="AVS Capacity Assessment (UsedPreferred / ProvisionedOnly, all node types)", bg="#C8E6C9", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text="1) Select RVTools export (vCPU + vMemory + vDisk)\n2) Choose sizing mode\n3) Select output Excel path\n4) Click Run.", justify="left").pack(anchor="w", pady=(0, 8))
+
+        rv_row = ttk.Frame(parent); rv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(rv_row, text="RVTools file:").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.assess_rvtools_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(rv_row, text="Browse...", command=self._browse_assess_rvtools).pack(side=tk.LEFT, padx=(8, 0))
+
+        mode_row = ttk.Frame(parent); mode_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(mode_row, text="Sizing mode:").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="UsedPreferred (Used if present, else Provisioned)", variable=self.assess_mode_var, value="UsedPreferred").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(mode_row, text="ProvisionedOnly", variable=self.assess_mode_var, value="ProvisionedOnly").pack(side=tk.LEFT, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output Excel:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.assess_out_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_assess_out).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_assess_btn = ttk.Button(controls, text="Run AVS Assessment", command=self._run_assessment_pipeline_threaded)
+        self.run_assess_btn.pack(side=tk.LEFT)
+        self.assess_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.assess_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_assess_rvtools(self):
+        fp = filedialog.askopenfilename(title="Select RVTools Excel (.xlsx)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.assess_rvtools_var.set(fp)
+
+    def _browse_assess_out(self):
+        fp = filedialog.asksaveasfilename(title="Select AVS Assessment output Excel file", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if fp: self.assess_out_var.set(fp)
+
+    def _run_assessment_pipeline_threaded(self):
+        rv = self.assess_rvtools_var.get().strip()
+        out = self.assess_out_var.get().strip()
+        if not os.path.isfile(rv): messagebox.showerror("RVTools file", f"RVTools file not found:\n{rv}"); return
+        if not out: messagebox.showerror("Output path", "Please select output Excel path."); return
+        mode = self.assess_mode_var.get()
+        self.run_assess_btn.configure(state="disabled")
+        self.assess_progress.start(15)
+        self._enqueue_log(f"[ASSM] Starting AVS assessment in mode: {mode}")
+        def work():
+            try:
+                outputs = run_assessment_pipeline_usedpreferred(rv, out, log_func=self._enqueue_log) if mode == "UsedPreferred" else run_assessment_pipeline_provisioned(rv, out, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_assess_success, outputs, mode)
+            except Exception as e:
+                self._enqueue_call(self._on_assess_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_assess_success(self, outputs: dict, mode: str):
+        self.assess_progress.stop()
+        self.run_assess_btn.configure(state="normal")
+        messagebox.showinfo(f"AVS Capacity Assessment ({mode})", f"Completed.\nOutput: {outputs.get('output_excel')}")
+
+    def _on_assess_error(self, msg: str):
+        self.assess_progress.stop()
+        self.run_assess_btn.configure(state="normal")
+        self._enqueue_log(f"[ASSM] ERROR: {msg}")
+        messagebox.showerror("AVS Assessment Error", msg)
+
+    # ------------------------------
+    # Azure VM Assessment tab
+    # ------------------------------
+    def _build_azure_assess_tab(self, parent):
+        _add_contact_banner(parent, "#D1C4E9")
+
+        header = tk.Frame(parent, bg="#D1C4E9")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="Azure VM Assessment (RVTools -> Azure VM Size Recommendation)", bg="#D1C4E9", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text="1) Select RVTools export (vCPU + vMemory)\n2) Choose family mode\n3) Set headroom %\n4) Select output Excel path\n5) Click Run.", justify="left").pack(anchor="w", pady=(0, 8))
+
+        rv_row = ttk.Frame(parent); rv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(rv_row, text="RVTools file:").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.azure_rvtools_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(rv_row, text="Browse...", command=self._browse_azure_rvtools).pack(side=tk.LEFT, padx=(8, 0))
+
+        fam_row = ttk.Frame(parent); fam_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(fam_row, text="Family mode:").pack(side=tk.LEFT)
+        ttk.Combobox(fam_row, textvariable=self.azure_family_var, values=["AUTO", "DSV5", "ESV5"], state="readonly", width=10).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(fam_row, text="(AUTO considers both Dsv5 & Esv5)").pack(side=tk.LEFT, padx=(8, 0))
+
+        hr_row = ttk.Frame(parent); hr_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(hr_row, text="Headroom %:").pack(side=tk.LEFT)
+        ttk.Entry(hr_row, textvariable=self.azure_headroom_var, width=10).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(hr_row, text="(e.g., 20)").pack(side=tk.LEFT, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output Excel:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.azure_out_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_azure_out).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_azure_btn = ttk.Button(controls, text="Run Azure VM Assessment", command=self._run_azure_assessment_threaded)
+        self.run_azure_btn.pack(side=tk.LEFT)
+        self.azure_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.azure_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_azure_rvtools(self):
+        fp = filedialog.askopenfilename(title="Select RVTools Excel (.xlsx)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.azure_rvtools_var.set(fp)
+
+    def _browse_azure_out(self):
+        fp = filedialog.asksaveasfilename(title="Select Azure VM Assessment output Excel file", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if fp: self.azure_out_var.set(fp)
+
+    def _run_azure_assessment_threaded(self):
+        rv = self.azure_rvtools_var.get().strip()
+        out = self.azure_out_var.get().strip()
+        fam = self.azure_family_var.get().strip().upper()
+        hr_str = self.azure_headroom_var.get().strip()
+        if not os.path.isfile(rv): messagebox.showerror("RVTools file", f"RVTools file not found:\n{rv}"); return
+        if not out: messagebox.showerror("Output path", "Please select output Excel path."); return
+        try: headroom = float(hr_str)
+        except Exception: messagebox.showerror("Headroom", f"Invalid headroom %: {hr_str}"); return
+        self.run_azure_btn.configure(state="disabled")
+        self.azure_progress.start(15)
+        self._enqueue_log("[AZURE] Starting Azure VM Assessment...")
+        def work():
+            try:
+                outputs = run_azure_vm_assessment_pipeline(rv, out, family_mode=fam, headroom_pct=headroom, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_azure_success, outputs, fam)
+            except Exception as e:
+                self._enqueue_call(self._on_azure_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_azure_success(self, outputs: dict, fam: str):
+        self.azure_progress.stop()
+        self.run_azure_btn.configure(state="normal")
+        messagebox.showinfo(f"Azure VM Assessment ({fam})", f"Completed.\nOutput: {outputs.get('output_excel')}")
+
+    def _on_azure_error(self, msg: str):
+        self.azure_progress.stop()
+        self.run_azure_btn.configure(state="normal")
+        self._enqueue_log(f"[AZURE] ERROR: {msg}")
+        messagebox.showerror("Azure VM Assessment Error", msg)
+
+    # ------------------------------
+    # NE Status tab
+    # ------------------------------
+    def _build_ne_tab(self, parent):
+        _add_contact_banner(parent, "#FFE082")
+
+        header = tk.Frame(parent, bg="#FFE082")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="HCX Network Extension (NE) Status Pull (Embedded PowerShell)", bg="#FFE082", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text=("Pull HCX Network Extension status (used for L2 extensions).\nOptional: provide CE-NE-VLAN mapping (Excel/CSV) to generate one enriched Excel report."), justify="left").pack(anchor="w", pady=(0, 8))
+
+        srv_row = ttk.Frame(parent); srv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(srv_row, text="HCX Server:").pack(side=tk.LEFT)
+        ttk.Entry(srv_row, textvariable=self.hcx_server_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        user_row = ttk.Frame(parent); user_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(user_row, text="Username:").pack(side=tk.LEFT)
+        ttk.Entry(user_row, textvariable=self.hcx_user_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        pass_row = ttk.Frame(parent); pass_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(pass_row, text="Password:").pack(side=tk.LEFT)
+        ttk.Entry(pass_row, textvariable=self.hcx_pass_var, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output folder:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.ne_output_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_ne_output_dir).pack(side=tk.LEFT, padx=(8, 0))
+
+        name_row = ttk.Frame(parent); name_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(name_row, text="NE Name contains (optional):").pack(side=tk.LEFT)
+        ttk.Entry(name_row, textvariable=self.ne_name_contains_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(name_row, text="(comma/space separated)").pack(side=tk.LEFT, padx=(8, 0))
+
+        id_row = ttk.Frame(parent); id_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(id_row, text="NE IDs (optional):").pack(side=tk.LEFT)
+        ttk.Entry(id_row, textvariable=self.ne_ids_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(id_row, text="(comma/space separated)").pack(side=tk.LEFT, padx=(8, 0))
+
+        map_row = ttk.Frame(parent); map_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(map_row, text="CE-NE-VLAN mapping (optional):").pack(side=tk.LEFT)
+        ttk.Entry(map_row, textvariable=self.ne_vlan_map_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(map_row, text="Browse...", command=self._browse_ne_vlan_map).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_ne_btn = ttk.Button(controls, text="Run NE Status Pull", command=self._run_ne_pipeline_threaded)
+        self.run_ne_btn.pack(side=tk.LEFT)
+        self.ne_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.ne_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_ne_output_dir(self):
+        d = filedialog.askdirectory(title="Select NE status output folder")
+        if d: self.ne_output_dir_var.set(d)
+
+    def _browse_ne_vlan_map(self):
+        fp = filedialog.askopenfilename(title="Select CE-NE-VLAN mapping (Excel/CSV)", filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("All files", "*.*")])
+        if fp: self.ne_vlan_map_var.set(fp)
+
+    def _run_ne_pipeline_threaded(self):
+        server = self.hcx_server_var.get().strip()
+        user = self.hcx_user_var.get().strip()
+        pwd = self.hcx_pass_var.get().strip()
+        outdir = self.ne_output_dir_var.get().strip()
+        name_pats = _split_multi(self.ne_name_contains_var.get().strip())
+        ids = _split_multi(self.ne_ids_var.get().strip())
+        map_path = self.ne_vlan_map_var.get().strip()
+        if not server: messagebox.showerror("HCX Server", "Please enter the HCX server (FQDN or IP)."); return
+        if not user: messagebox.showerror("Username", "Please enter the HCX username."); return
+        if not pwd: messagebox.showerror("Password", "Please enter the HCX password."); return
+        if not outdir: messagebox.showerror("Output folder", "Please select an output folder."); return
+        self.run_ne_btn.configure(state="disabled")
+        self.ne_progress.start(15)
+        self._enqueue_log(f"[NE] Starting NE status pull for HCX: {server}")
+        if name_pats: self._enqueue_log(f"[NE] Filter Name Contains: {name_pats}")
+        if ids: self._enqueue_log(f"[NE] Filter NE IDs: {ids}")
+        if map_path: self._enqueue_log(f"[NE] VLAN mapping file: {map_path}")
+        def work():
+            try:
+                outputs = run_ne_status_script(server, user, pwd, outdir, ne_ids=ids, name_patterns=name_pats, log_func=self._enqueue_log)
+                if map_path and os.path.isfile(map_path):
+                    try:
+                        raw_csv = outputs["raw_csv"]
+                        ts_match = re.search(r"NE_Status_Raw_(\d{8}_\d{6})\.csv$", raw_csv.replace("\\", "/"))
+                        ts = ts_match.group(1) if ts_match else datetime.now().strftime("%Y%m%d_%H%M%S")
+                        enriched_out = str(Path(outputs["run_dir"]) / f"NE_VLAN_Status_Enriched_{ts}.xlsx")
+                        enr = enrich_ne_status_with_vlan_mapping(raw_csv, map_path, enriched_out, log_func=self._enqueue_log)
+                        outputs.update(enr)
+                    except Exception as e:
+                        outputs["enrichment_error"] = str(e)
+                self._enqueue_call(self._on_ne_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_ne_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ne_success(self, outputs: dict):
+        self.ne_progress.stop()
+        self.run_ne_btn.configure(state="normal")
+        self._enqueue_log("[NE] Outputs:")
+        for k, v in outputs.items(): self._enqueue_log(f"[NE]  - {k}: {v}")
+        msg = f"NE status export completed.\nRun folder:\n{outputs.get('run_dir')}"
+        if outputs.get("enriched_excel"): msg += f"\n\nEnriched Excel:\n{outputs.get('enriched_excel')}"
+        if outputs.get("enrichment_error"): msg += f"\n\nWARNING: Enrichment failed:\n{outputs.get('enrichment_error')}"
+        messagebox.showinfo("NE Status Pull", msg)
+
+    def _on_ne_error(self, msg: str):
+        self.ne_progress.stop()
+        self.run_ne_btn.configure(state="normal")
+        self._enqueue_log(f"[NE] ERROR: {msg}")
+        messagebox.showerror("NE Status Error", msg)
+
+    # ------------------------------
+    # HCX Status tab
+    # ------------------------------
+    def _build_hcx_tab(self, parent):
+        _add_contact_banner(parent, "#FFE0B2")
+
+        header = tk.Frame(parent, bg="#FFE0B2")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="HCX Migration Status Pull (Embedded PowerShell)", bg="#FFE0B2", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text=("This tab runs the embedded PowerShell script for HCX status.\nProvide HCX server, username, password, and filters, then click Run.\nOutputs are written under the chosen output folder."), justify="left").pack(anchor="w", pady=(0, 8))
+
+        srv_row = ttk.Frame(parent); srv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(srv_row, text="HCX Server:").pack(side=tk.LEFT)
+        ttk.Entry(srv_row, textvariable=self.hcx_server_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        user_row = ttk.Frame(parent); user_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(user_row, text="Username:").pack(side=tk.LEFT)
+        ttk.Entry(user_row, textvariable=self.hcx_user_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        pass_row = ttk.Frame(parent); pass_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(pass_row, text="Password:").pack(side=tk.LEFT)
+        ttk.Entry(pass_row, textvariable=self.hcx_pass_var, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output folder:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.hcx_output_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_hcx_output_dir).pack(side=tk.LEFT, padx=(8, 0))
+
+        gid_row = ttk.Frame(parent); gid_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(gid_row, text="Group IDs (optional):").pack(side=tk.LEFT)
+        ttk.Entry(gid_row, textvariable=self.hcx_group_ids_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(gid_row, text="(comma/space separated)").pack(side=tk.LEFT, padx=(8, 0))
+
+        gname_row = ttk.Frame(parent); gname_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(gname_row, text="Name contains (optional):").pack(side=tk.LEFT)
+        ttk.Entry(gname_row, textvariable=self.hcx_group_names_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(gname_row, text="(comma/space separated)").pack(side=tk.LEFT, padx=(8, 0))
+
+        gfile_row = ttk.Frame(parent); gfile_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(gfile_row, text="Group ID file (optional):").pack(side=tk.LEFT)
+        ttk.Entry(gfile_row, textvariable=self.hcx_groupid_file_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(gfile_row, text="Browse...", command=self._browse_hcx_groupid_file).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_hcx_btn = ttk.Button(controls, text="Run HCX Status Pull", command=self._run_hcx_pipeline_threaded)
+        self.run_hcx_btn.pack(side=tk.LEFT)
+        self.hcx_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.hcx_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_hcx_output_dir(self):
+        d = filedialog.askdirectory(title="Select HCX output folder")
+        if d: self.hcx_output_dir_var.set(d)
+
+    def _browse_hcx_groupid_file(self):
+        fp = filedialog.askopenfilename(title="Select Group ID file (one ID per line)", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if fp: self.hcx_groupid_file_var.set(fp)
+
+    def _run_hcx_pipeline_threaded(self):
+        server = self.hcx_server_var.get().strip()
+        user = self.hcx_user_var.get().strip()
+        pwd = self.hcx_pass_var.get().strip()
+        outdir = self.hcx_output_dir_var.get().strip()
+        group_ids = _split_multi(self.hcx_group_ids_var.get().strip())
+        group_names = _split_multi(self.hcx_group_names_var.get().strip())
+        gid_file = self.hcx_groupid_file_var.get().strip()
+        if not server: messagebox.showerror("HCX Server", "Please enter the HCX server (FQDN or IP)."); return
+        if not user: messagebox.showerror("Username", "Please enter the HCX username."); return
+        if not pwd: messagebox.showerror("Password", "Please enter the HCX password."); return
+        if not outdir: messagebox.showerror("Output folder", "Please select an output folder."); return
+        self.run_hcx_btn.configure(state="disabled")
+        self.hcx_progress.start(15)
+        self._enqueue_log(f"[HCX] Starting HCX status pull for server: {server}")
+        def work():
+            try:
+                outputs = run_hcx_status_script(server, user, pwd, outdir, group_ids=group_ids, group_name_patterns=group_names, group_id_file=(gid_file if gid_file else None), log_func=self._enqueue_log)
+                self._enqueue_call(self._on_hcx_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_hcx_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_hcx_success(self, outputs: dict):
+        self.hcx_progress.stop()
+        self.run_hcx_btn.configure(state="normal")
+        messagebox.showinfo("HCX Status Pull", f"HCX status export completed.\nCheck folder: {outputs.get('output_dir')}")
+
+    def _on_hcx_error(self, msg: str):
+        self.hcx_progress.stop()
+        self.run_hcx_btn.configure(state="normal")
+        self._enqueue_log(f"[HCX] ERROR: {msg}")
+        messagebox.showerror("HCX Status Error", msg)
+
+    # ------------------------------
+    # Large VMs tab
+    # ------------------------------
+    def _build_large_tab(self, parent):
+        _add_contact_banner(parent, "#E1BEE7")
+
+        header = tk.Frame(parent, bg="#E1BEE7")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="Large VMs Report (RVTools vDisk-based)", bg="#E1BEE7", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text="1) Select RVTools export\n2) Enter threshold in TB\n3) Choose output folder\n4) Click Run.", justify="left").pack(anchor="w", pady=(0, 8))
+
+        rv_row = ttk.Frame(parent); rv_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(rv_row, text="RVTools file:").pack(side=tk.LEFT)
+        ttk.Entry(rv_row, textvariable=self.large_rvtools_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(rv_row, text="Browse...", command=self._browse_large_rvtools).pack(side=tk.LEFT, padx=(8, 0))
+
+        thr_row = ttk.Frame(parent); thr_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(thr_row, text="Threshold TB:").pack(side=tk.LEFT)
+        ttk.Entry(thr_row, textvariable=self.large_threshold_var, width=10).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(thr_row, text="(e.g., 1.0, 2.0)").pack(side=tk.LEFT, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output folder:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.large_output_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_large_output_dir).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_large_btn = ttk.Button(controls, text="Run Large VMs Report", command=self._run_large_pipeline_threaded)
+        self.run_large_btn.pack(side=tk.LEFT)
+        self.large_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.large_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_large_rvtools(self):
+        fp = filedialog.askopenfilename(title="Select RVTools Excel (.xlsx)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.large_rvtools_var.set(fp)
+
+    def _browse_large_output_dir(self):
+        d = filedialog.askdirectory(title="Select Large VMs output folder")
+        if d: self.large_output_dir_var.set(d)
+
+    def _run_large_pipeline_threaded(self):
+        rv = self.large_rvtools_var.get().strip()
+        outdir = self.large_output_dir_var.get().strip()
+        thr_str = self.large_threshold_var.get().strip()
+        if not os.path.isfile(rv): messagebox.showerror("RVTools file", f"RVTools file not found:\n{rv}"); return
+        if not outdir: messagebox.showerror("Output folder", "Please select an output folder."); return
+        try: thr_tb = float(thr_str)
+        except Exception: messagebox.showerror("Threshold", f"Invalid threshold TB: {thr_str}"); return
+        self.run_large_btn.configure(state="disabled")
+        self.large_progress.start(15)
+        self._enqueue_log(f"[LARGE] Starting Large VMs report (threshold {thr_tb} TB)")
+        def work():
+            try:
+                outputs = run_largevm_pipeline(rv, thr_tb, outdir, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_large_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_large_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_large_success(self, outputs: dict):
+        self.large_progress.stop()
+        self.run_large_btn.configure(state="normal")
+        messagebox.showinfo("Large VMs Report", f"Completed.\nOutput: {outputs.get('output_excel')}\nLarge VM count: {outputs.get('large_vm_count')}")
+
+    def _on_large_error(self, msg: str):
+        self.large_progress.stop()
+        self.run_large_btn.configure(state="normal")
+        self._enqueue_log(f"[LARGE] ERROR: {msg}")
+        messagebox.showerror("Large VMs Error", msg)
+
+    # ------------------------------
+    # Post-Migration tab
+    # ------------------------------
+    def _build_post_tab(self, parent):
+        _add_contact_banner(parent, "#CFD8DC")
+
+        header = tk.Frame(parent, bg="#CFD8DC")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="Post-Migration Validation (Ping + Traceroute for Scoped Servers)", bg="#CFD8DC", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+        ttk.Label(parent, text="Use this after cutover:\n1) Select the updated scoped server list\n2) Select output Excel path\n3) Click Run.", justify="left").pack(anchor="w", pady=(0, 8))
+
+        sc_row = ttk.Frame(parent); sc_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(sc_row, text="Scoped servers:").pack(side=tk.LEFT)
+        ttk.Entry(sc_row, textvariable=self.post_scope_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(sc_row, text="Browse...", command=self._browse_post_scope).pack(side=tk.LEFT, padx=(8, 0))
+
+        out_row = ttk.Frame(parent); out_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(out_row, text="Output Excel:").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.post_out_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(out_row, text="Browse...", command=self._browse_post_out).pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_post_btn = ttk.Button(controls, text="Run Post-Migration Validation", command=self._run_post_pipeline_threaded)
+        self.run_post_btn.pack(side=tk.LEFT)
+        self.post_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.post_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_post_scope(self):
+        fp = filedialog.askopenfilename(title="Select updated scoped servers Excel (must have 'Server' column)", filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if fp: self.post_scope_path_var.set(fp)
+
+    def _browse_post_out(self):
+        fp = filedialog.asksaveasfilename(title="Select Post-Migration output Excel file", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if fp: self.post_out_path_var.set(fp)
+
+    def _run_post_pipeline_threaded(self):
+        sc = self.post_scope_path_var.get().strip()
+        out = self.post_out_path_var.get().strip()
+        if not os.path.isfile(sc): messagebox.showerror("Scoped file", f"Scoped servers file not found:\n{sc}"); return
+        if not out: messagebox.showerror("Output path", "Please select output Excel path."); return
+        self.run_post_btn.configure(state="disabled")
+        self.post_progress.start(15)
+        self._enqueue_log("[POST] Starting post-migration validation...")
+        def work():
+            try:
+                outputs = run_postmigration_pipeline(sc, out, log_func=self._enqueue_log)
+                self._enqueue_call(self._on_post_success, outputs)
+            except Exception as e:
+                self._enqueue_call(self._on_post_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_post_success(self, outputs: dict):
+        self.post_progress.stop()
+        self.run_post_btn.configure(state="normal")
+        messagebox.showinfo("Post-Migration Validation", f"Completed.\nOutput: {outputs.get('output_excel')}\nServers total : {outputs.get('servers_total')}\nPing success  : {outputs.get('ping_success')}")
+
+    def _on_post_error(self, msg: str):
+        self.post_progress.stop()
+        self.run_post_btn.configure(state="normal")
+        self._enqueue_log(f"[POST] ERROR: {msg}")
+        messagebox.showerror("Post-Migration Error", msg)
+
+    # ------------------------------
+    # NSX-T to Azure NSG tab (MERGED from second script)
+    # ------------------------------
+    def _build_nsx_tab(self, parent):
+        _add_contact_banner(parent, "#B2DFDB")
+
+        header = tk.Frame(parent, bg="#B2DFDB")
+        header.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(header, text="NSX-T to Azure NSG Mapping (CSV Analyzer)", bg="#B2DFDB", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=4)
+
+        ttk.Label(
+            parent,
+            text=("Analyze AVS NSX-T firewall logs and generate proposed Azure NSG rules.\n"
+                  "1) Select one or more NSX-T log exports (CSV/Excel)\n"
+                  "   Required columns: Timestamp, RuleId, Action, Direction, Protocol,\n"
+                  "   SourceIp, DestinationIp, SourcePort, DestinationPort\n"
+                  "2) Configure options and click Run."),
+            justify="left"
+        ).pack(anchor="w", pady=(0, 8))
+
+        frow = ttk.Frame(parent); frow.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(frow, text="NSX-T exports:").pack(side=tk.LEFT)
+        ttk.Entry(frow, textvariable=self.nsx_files_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(frow, text="Browse...", command=self._browse_nsx_files).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(frow, text="Clear", command=self._clear_nsx_files).pack(side=tk.LEFT, padx=(8, 0))
+
+        orow = ttk.Frame(parent); orow.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(orow, text="Output folder:").pack(side=tk.LEFT)
+        ttk.Entry(orow, textvariable=self.nsx_out_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(orow, text="Browse...", command=self._browse_nsx_out).pack(side=tk.LEFT, padx=(8, 0))
+
+        opts = ttk.Frame(parent); opts.pack(fill=tk.X, pady=(4, 4))
+        ttk.Checkbutton(opts, text="Proposed rules from PASS only", variable=self.nsx_pass_only_var).pack(side=tk.LEFT)
+        ttk.Label(opts, text="Source agg threshold:").pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Entry(opts, textvariable=self.nsx_threshold_var, width=6).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(opts, text="(IPs per dest before /24 aggregation)").pack(side=tk.LEFT, padx=(8, 0))
+
+        controls = ttk.Frame(parent); controls.pack(fill=tk.X, pady=(6, 4))
+        self.run_nsx_btn = ttk.Button(controls, text="Run NSX-T to NSG Analysis", command=self._run_nsx_pipeline_threaded)
+        self.run_nsx_btn.pack(side=tk.LEFT)
+        self.nsx_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.nsx_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+    def _browse_nsx_files(self):
+        fps = filedialog.askopenfilenames(
+            title="Select NSX-T exports",
+            filetypes=[("CSV/Excel", "*.csv *.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if fps:
+            self.nsx_files = list(fps)
+            self.nsx_files_var.set(" ; ".join(self.nsx_files))
+
+    def _clear_nsx_files(self):
+        self.nsx_files = []
+        self.nsx_files_var.set("")
+
+    def _browse_nsx_out(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d: self.nsx_out_var.set(d)
+
+    def _run_nsx_pipeline_threaded(self):
+        files = self.nsx_files or [p.strip() for p in self.nsx_files_var.get().split(";") if p.strip()]
+        files = [p for p in files if os.path.isfile(p)]
+        if not files:
+            messagebox.showerror("Inputs", "Select at least one NSX-T export file."); return
+        out_base = self.nsx_out_var.get().strip()
+        if not out_base:
+            messagebox.showerror("Output", "Select an output folder."); return
+        try:
+            thr = int(float(self.nsx_threshold_var.get().strip()))
+        except Exception:
+            messagebox.showerror("Threshold", "Threshold must be a number (e.g., 20)."); return
+
+        run_dir = str(Path(out_base) / f"NSXT_to_NSG_CSV_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        pass_only = bool(self.nsx_pass_only_var.get())
+        self.run_nsx_btn.configure(state="disabled")
+        self.nsx_progress.start(12)
+        self._enqueue_log(f"[NSX] Output: {run_dir}")
+        for f in files: self._enqueue_log(f"[NSX] Input : {f}")
+
+        def work():
+            try:
+                outputs = run_nsx_csv_analysis(files, run_dir, pass_only, thr, log=self._enqueue_log)
+                self._enqueue_call(self._on_nsx_success, outputs, run_dir)
+            except Exception as e:
+                self._enqueue_call(self._on_nsx_error, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_nsx_success(self, outputs: Dict[str, str], run_dir: str):
+        self.nsx_progress.stop()
+        self.run_nsx_btn.configure(state="normal")
+        self._enqueue_log("[NSX] Done. Files:")
+        for k, v in outputs.items(): self._enqueue_log(f"  - {k}: {v}")
+        messagebox.showinfo("NSX-T to NSG", f"Completed.\n\n{run_dir}")
+
+    def _on_nsx_error(self, msg: str):
+        self.nsx_progress.stop()
+        self.run_nsx_btn.configure(state="normal")
+        self._enqueue_log(f"[NSX] ERROR: {msg}")
+        messagebox.showerror("NSX-T to NSG Error", msg)
+
+
+# ------------------------------
+# Entry point
+# ------------------------------
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
